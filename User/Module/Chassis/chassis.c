@@ -481,6 +481,9 @@ uint8_t Chassis_Stop(Chassis_Object *chassis)
 
 /**
   * @brief  立即主动保持(硬停, 不经过斜坡)
+  * @note   P0-1: 只置请求标志与模式, **不在本函数里发串口**。
+  *         所有运行期发送集中在 Chassis_Task(中断上下文), 避免主循环与
+  *         Task 争抢 USART2 导致 $spd:0 被 BUSY 丢弃。
   */
 uint8_t Chassis_Hold(Chassis_Object *chassis)
 {
@@ -497,15 +500,15 @@ uint8_t Chassis_Hold(Chassis_Object *chassis)
   chassis->mode = CHASSIS_MODE_HOLD;
   chassis->stats.hold_count++;
 
-  if (Chassis_SendHold(chassis, chassis->last_task_ms) != 0U)
-  {
-    return (uint8_t)CHASSIS_ERR_BUSY;
-  }
+  /* 指令先置 pending 再置 mode, 保证 Task 看到 HOLD 时一定会补发 */
+  chassis->hold_pending  = 1U;
+  chassis->coast_pending = 0U;
   return (uint8_t)CHASSIS_OK;
 }
 
 /**
   * @brief  立即断开输出(滑行)
+  * @note   P0-1: 同 Chassis_Hold, 只置标志, 由 Chassis_Task 发送。
   */
 uint8_t Chassis_Coast(Chassis_Object *chassis)
 {
@@ -525,16 +528,9 @@ uint8_t Chassis_Coast(Chassis_Object *chassis)
   {
     return (uint8_t)CHASSIS_ERR_BUSY;
   }
-  if (chassis->ops->coast(chassis->motor_ctx) != 0U)
-  {
-    chassis->stats.cmd_busy++;
-    return (uint8_t)CHASSIS_ERR_BUSY;
-  }
-  for (uint8_t i = 0U; i < CHASSIS_MOTOR_NUM; i++)
-  {
-    chassis->wheel_cmd[i] = 0.0f;
-  }
-  chassis->last_tx_ms = chassis->last_task_ms;
+
+  chassis->coast_pending = 1U;
+  chassis->hold_pending  = 0U;
   return (uint8_t)CHASSIS_OK;
 }
 
@@ -589,6 +585,58 @@ void Chassis_Task(Chassis_Object *chassis, uint32_t now_ms)
 
   dt_s = (float)dt_ms * 0.001f;
 
+  /* P0-1: 停车/急停请求一律在这里落地。
+     驱动板是"保持型速度指令", 丢一帧 $spd:0 车就按旧速度一直跑,
+     所以 pending 标志只在**发送成功**时清除, 失败下一拍自动重试。 */
+  if (chassis->hold_pending != 0U)
+  {
+    if (Chassis_SendHold(chassis, now_ms) == 0U)
+    {
+      chassis->hold_pending = 0U;
+    }
+    Chassis_UpdateFeedback(chassis, now_ms);
+    return;      /* 本拍不再发速度帧, 保证停车帧优先 */
+  }
+  if (chassis->coast_pending != 0U)
+  {
+    if ((chassis->ops == NULL) || (chassis->ops->coast == NULL) ||
+        (chassis->ops->coast(chassis->motor_ctx) == 0U))
+    {
+      chassis->coast_pending = 0U;
+      for (uint8_t i = 0U; i < CHASSIS_MOTOR_NUM; i++)
+      {
+        chassis->wheel_cmd[i] = 0.0f;
+      }
+      chassis->last_tx_ms = now_ms;
+    }
+    else
+    {
+      chassis->stats.cmd_busy++;
+    }
+    Chassis_UpdateFeedback(chassis, now_ms);
+    return;
+  }
+
+  /* P2-1: 未使能时强制 HOLD, 拒绝一切速度指令 */
+  if (chassis->enabled == 0U)
+  {
+    if (chassis->mode != CHASSIS_MODE_HOLD)
+    {
+      chassis->mode = CHASSIS_MODE_HOLD;
+      chassis->cmd_v_mmps = 0.0f;
+      chassis->cmd_w_dps  = 0.0f;
+      chassis->target_v_mmps = 0.0f;
+      chassis->target_w_dps  = 0.0f;
+    }
+    /* 周期重发: 驱动板丢帧/重启后能自己回到静止 */
+    if ((now_ms - chassis->last_tx_ms) >= chassis->cfg.command_period_ms)
+    {
+      (void)Chassis_SendHold(chassis, now_ms);
+    }
+    Chassis_UpdateFeedback(chassis, now_ms);
+    return;
+  }
+
   switch (chassis->mode)
   {
     case CHASSIS_MODE_VELOCITY:
@@ -614,11 +662,10 @@ void Chassis_Task(Chassis_Object *chassis, uint32_t now_ms)
       {
         chassis->cmd_v_mmps = 0.0f;
         chassis->cmd_w_dps  = 0.0f;
-        if (Chassis_SendHold(chassis, now_ms) == 0U)
-        {
-          chassis->mode = CHASSIS_MODE_HOLD;
-          chassis->stats.hold_count++;
-        }
+        /* 降完速后转 HOLD: 交给上面的 hold_pending 通道统一发送 */
+        chassis->mode = CHASSIS_MODE_HOLD;
+        chassis->hold_pending = 1U;
+        chassis->stats.hold_count++;
       }
       else if ((now_ms - chassis->last_tx_ms) >= chassis->cfg.command_period_ms)
       {
@@ -627,6 +674,13 @@ void Chassis_Task(Chassis_Object *chassis, uint32_t now_ms)
       break;
 
     case CHASSIS_MODE_HOLD:
+      /* P0-1: HOLD 期间也按周期重发 $spd:0, 防驱动板丢一帧就失控 */
+      if ((now_ms - chassis->last_tx_ms) >= chassis->cfg.command_period_ms)
+      {
+        (void)Chassis_SendHold(chassis, now_ms);
+      }
+      break;
+
     case CHASSIS_MODE_COAST:
     case CHASSIS_MODE_IDLE:
     default:
@@ -641,6 +695,29 @@ void Chassis_Task(Chassis_Object *chassis, uint32_t now_ms)
 Chassis_Mode_e Chassis_GetMode(const Chassis_Object *chassis)
 {
   return (chassis == NULL) ? CHASSIS_MODE_IDLE : chassis->mode;
+}
+
+/* P2-1: 使能门控 ------------------------------------------------------------*/
+
+void Chassis_SetEnabled(Chassis_Object *chassis, uint8_t enabled)
+{
+  if ((chassis == NULL) || (chassis->initialized == 0U))
+  {
+    return;
+  }
+
+  chassis->enabled = (enabled != 0U) ? 1U : 0U;
+
+  if (chassis->enabled == 0U)
+  {
+    /* 置 HOLD + 停车请求; 不在这里发串口(见 P0-1) */
+    (void)Chassis_Hold(chassis);
+  }
+}
+
+uint8_t Chassis_IsEnabled(const Chassis_Object *chassis)
+{
+  return (chassis == NULL) ? 0U : chassis->enabled;
 }
 
 float Chassis_GetTargetLinearMmps(const Chassis_Object *chassis)

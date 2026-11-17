@@ -196,6 +196,13 @@ struct Chassis_Object
   uint32_t last_tx_ms;                     /* 最近一次下发时间 */
   uint8_t  target_dirty;                   /* 目标已更新, Task 下一拍登记租约 */
 
+  /* P0-1: 停车/急停请求只置标志, 真正发送统一在 Chassis_Task 里做。
+     主循环不发 AT8236 帧 —— 否则会与中断里的 Task 抢 USART2,
+     一旦 BUSY 丢掉 $spd:0, 驱动板按最后速度一直跑。 */
+  volatile uint8_t hold_pending;           /* 请求 $spd:0, 发成功才清 */
+  volatile uint8_t coast_pending;          /* 请求 $pwm:0, 发成功才清 */
+  uint8_t  enabled;                        /* 0 = 强制 HOLD, 忽略一切速度指令(P2-1) */
+
   Chassis_Odometry_t odom;                 /* 里程计 */
   Chassis_Stats_t    stats;
   uint8_t initialized;
@@ -220,6 +227,14 @@ uint8_t Chassis_Stop(Chassis_Object *chassis);
 uint8_t Chassis_Hold(Chassis_Object *chassis);
 uint8_t Chassis_Coast(Chassis_Object *chassis);
 uint8_t Chassis_EmergencyStop(Chassis_Object *chassis);
+
+/**
+  * 使能门控(P2-1)
+  * @note  禁止后 Chassis_Task 强制 HOLD 并拒绝一切速度指令;
+  *        允许后不会自动开始运动, 需再下发目标。
+  */
+void    Chassis_SetEnabled(Chassis_Object *chassis, uint8_t enabled);
+uint8_t Chassis_IsEnabled(const Chassis_Object *chassis);
 
 /**
   * 周期任务(建议 10ms 调用): 斜坡、限幅、下发、反馈、里程计、看门狗

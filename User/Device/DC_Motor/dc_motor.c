@@ -95,9 +95,11 @@ void DC_Motor_Enable(DC_MotorId_e id, bool enable)
     if (id <= DC_MOTOR_RR)
     {
         s_chassis_enabled = enable;
-        if (!enable && (s_chassis != NULL))
+        /* P2-1: 使能门控下沉到 Chassis —— 未使能时 Chassis_Task 会强制 HOLD
+           并拒绝一切速度指令, 而不只是"发一次 hold" */
+        if (s_chassis != NULL)
         {
-            (void)Chassis_Hold(s_chassis);
+            Chassis_SetEnabled(s_chassis, enable ? 1U : 0U);
         }
     }
     else if (id == DC_MOTOR_LIFT)
@@ -112,6 +114,8 @@ void DC_Motor_Enable(DC_MotorId_e id, bool enable)
 
 /**
   * @brief  紧急停止: 底盘 hold(驱动板 $spd:0), 升降输出 0
+  * @note   P0-1: 底盘停车帧由 Chassis_Task 在中断里落地(hold_pending),
+  *         本函数只清使能与目标, 不会因 USART2 忙而丢掉停车指令。
   */
 void DC_Motor_EmergencyStopAll(void)
 {
@@ -121,6 +125,7 @@ void DC_Motor_EmergencyStopAll(void)
 
     if (s_chassis != NULL)
     {
+        (void)Chassis_SetEnabled(s_chassis, 0U);
         (void)Chassis_Hold(s_chassis);
     }
     if (s_lift != NULL)
