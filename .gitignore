@@ -1,0 +1,34 @@
+# ---- 构建产物 (不提交) ----
+build/
+cmake-build-*/
+*.elf
+*.hex
+*.bin
+*.map
+*.o
+*.d
+*.su
+*.lst
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.cache/
+compile_commands.json
+Thumbs.db
+desktop.ini
+*~
+
+# ---- 另一台车(智能分拣机)的 APP 层备份, 与本工程无关, 不公开 ----
+User/APP/.legacy_v1_backup/
+
+# ---- CMSIS 大体积组件 (本工程不使用, 见 README_APP.md §2.1) ----
+# 构建只引用 Drivers/CMSIS/Include 与 Drivers/CMSIS/Device/ST/STM32F1xx/Include
+# 这三个目录合计约 48MB, 留在 CubeMX 工程里本地用, 不进仓库
+Drivers/CMSIS/Lib/
+Drivers/CMSIS/DSP/
+Drivers/CMSIS/NN/
+Drivers/CMSIS/Core_A/
+Drivers/CMSIS/RTOS/
+Drivers/CMSIS/RTOS2/
+Drivers/CMSIS/docs/

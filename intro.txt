@@ -1,0 +1,20 @@
+技术规格（ Tech specs) 参数（ Parameters ）
+电源输入（ Input Volttage recommended) 5-12v
+5v 电源输出（ DC Current for 5v Pin) 0.7A
+3.3V 电源输出（ DC Current for 3.3v Pin) 500ma
+单路电机持续驱动电流 默认 4A( 最大可输出 5.5A)
+ 
+四路电机驱动板简介  
+产品介绍：  
+四路编码器电机驱动模块集成高性能单片机协处理器，能够通过串口或 IIC 通讯方式与 MSPM0 、 STM32 、树莓派
+和 Jetson 等多种控制器无缝对接，简化了驱动过程。仅需四根连接线即可实现与主控单元的高效通讯从而轻松控制电
+机并获取编码器数据，减少了接线数量，降低了操作难度。同时支持驱动市面上大多数的霍尔编码器 TT 电机、
+520/310 等直流减速电机。
+参数表：  
+
+技术规格（ Tech specs) 参数（ Parameters ）
+长宽高（ Length * Width * High ） 56 * 65 * 13.4mm
+编码器电机接口 PH2.0-6PIN 、杜邦线插座
+直流电机接口 XH2.54-2PIN
+ 
+ 
