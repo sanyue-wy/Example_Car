@@ -293,12 +293,20 @@ static void Debug_Run(uint32_t now)
             if (s_home_started == 0U)
             {
                 s_home_started = 1U;
+#if (LIFT_ZERO_AT_POWERUP == 1)
+                /* P1-3: 上电即零点, 不做堵转回零; 直接进入高度闭环验证 */
+                DBG("[lift] [PASS] LIFT_ZERO_AT_POWERUP=1, 上电位置即零点\r\n");
+                s_lstep = LD_UP;
+                (void)Lift_SetHeight(LIFT_H_LEVEL1);
+                return;
+#else
                 if (Lift_StartHoming() != 0U)
                 {
                     DBG("[lift] [FAIL] 回零无法启动\r\n");
                     s_lstep = LD_IDLE;
                     return;
                 }
+#endif
             }
             if (Lift_GetHomingState() == LIFT_HOMING_DONE)
             {
@@ -358,7 +366,15 @@ static void Debug_Run(uint32_t now)
  *============================================================================*/
 #elif (chassis_debug == 1)
 
-typedef enum { CD_STRAIGHT1, CD_TURN, CD_STRAIGHT2, CD_DONE } ChassisDbgStep_e;
+typedef enum
+{
+    CD_STRAIGHT1 = 0,
+    CD_TURN,
+    CD_LONG_LEFT,     /* P0-5: +270deg, 超过 180 才暴露折返 bug */
+    CD_LONG_RIGHT,    /* P0-5: -270deg */
+    CD_STRAIGHT2,
+    CD_DONE
+} ChassisDbgStep_e;
 
 static ChassisDbgStep_e s_cstep;
 static uint8_t          s_turn_cnt;
@@ -396,16 +412,17 @@ static void Debug_Run(uint32_t now)
     switch (s_cstep)
     {
         case CD_STRAIGHT1:
-            DBG("[chassis] 直行 target=%ld achieved=%ld st=%d\r\n",
-                (long)rep.target, (long)rep.achieved, (int)rep.state);
+            /* P0-4: err = target - achieved, 正数表示没走够 */
+            DBG("[chassis] 直行 target=%ld achieved=%ld err=%ld st=%d\r\n",
+                (long)rep.target, (long)rep.achieved, (long)rep.error, (int)rep.state);
             (void)ChassisMotion_Turn(90.0f, CHASSIS_W_MAX_DPS * 0.6f, 0U);
             s_turn_cnt = 1U;
             s_cstep = CD_TURN;
             break;
 
         case CD_TURN:
-            DBG("[chassis] 转 %u/4 achieved=%ld st=%d\r\n",
-                (unsigned)s_turn_cnt, (long)rep.achieved, (int)rep.state);
+            DBG("[chassis] 转 %u/4 achieved=%ld err=%ld st=%d\r\n",
+                (unsigned)s_turn_cnt, (long)rep.achieved, (long)rep.error, (int)rep.state);
 
             if (s_turn_cnt < 4U)
             {
@@ -414,10 +431,33 @@ static void Debug_Run(uint32_t now)
             }
             else
             {
-                DBG("[chassis] [PASS] 四轮 90x4 完成, 开始第二个 1000mm\r\n");
-                (void)ChassisMotion_MoveStraight(1000.0f, CHASSIS_V_SLOW_MMS, 0U);
-                s_cstep = CD_STRAIGHT2;
+                DBG("[chassis] 90x4 完成, 测 >180deg 连续转角(P0-5)\r\n");
+                (void)ChassisMotion_Turn(270.0f, CHASSIS_W_MAX_DPS * 0.6f, 0U);
+                s_cstep = CD_LONG_LEFT;
             }
+            break;
+
+        case CD_LONG_LEFT:
+            DBG("[chassis] +270 achieved=%ld err=%ld st=%d\r\n",
+                (long)rep.achieved, (long)rep.error, (int)rep.state);
+            if (rep.state != CMOTION_DONE)
+            {
+                DBG("[chassis] [FAIL] +270 未完成(checked P0-5)\r\n");
+            }
+            (void)ChassisMotion_Turn(-270.0f, CHASSIS_W_MAX_DPS * 0.6f, 0U);
+            s_cstep = CD_LONG_RIGHT;
+            break;
+
+        case CD_LONG_RIGHT:
+            DBG("[chassis] -270 achieved=%ld err=%ld st=%d\r\n",
+                (long)rep.achieved, (long)rep.error, (int)rep.state);
+            if (rep.state != CMOTION_DONE)
+            {
+                DBG("[chassis] [FAIL] -270 未完成(checked P0-5)\r\n");
+            }
+            DBG("[chassis] [PASS] 开始第二个 1000mm\r\n");
+            (void)ChassisMotion_MoveStraight(1000.0f, CHASSIS_V_SLOW_MMS, 0U);
+            s_cstep = CD_STRAIGHT2;
             break;
 
         case CD_STRAIGHT2:

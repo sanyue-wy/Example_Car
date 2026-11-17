@@ -42,6 +42,21 @@
 
 /* Private types -------------------------------------------------------------*/
 
+/* Private types -------------------------------------------------------------*/
+
+/**
+  * @brief  收尾阶段(APP_FINISH 与 MATCH 下的 APP_FAULT 共用)
+  */
+typedef enum
+{
+    FIN_PARK_CHASSIS = 0,  /* 底盘减速到 0 */
+    FIN_PARK_LIFT,         /* 升降降回 HOME(可选) */
+    FIN_WAIT_STOP,         /* 等所有执行器确实停稳 */
+    FIN_DISABLE,           /* 禁用电机(舵机保持) */
+    FIN_SETTLE,            /* 等 FINISH_SETTLE_MS */
+    FIN_DONE
+} AppFinishPhase_e;
+
 typedef struct
 {
     AppState_e state;
@@ -62,6 +77,7 @@ typedef struct
     uint8_t    homing_wait;     /* 启动后正在等升降回零完成 */
     uint8_t    finish_phase;    /* AppFinishPhase_e */
     uint32_t   phase_ms;        /* 收尾分阶段计时 */
+    uint8_t    geofence_warned; /* P1-2: 越界已记录(只记录模式下防刷屏) */
 
     /* 脚本执行器 */
     uint8_t    prg[AppScriptProgramSlots];
@@ -119,6 +135,14 @@ static void App_SetState(AppState_e st)
 {
     s_app.state    = st;
     s_app.state_ms = HAL_GetTick();
+
+    /* P1-1: 进入 FAULT 时把收尾阶段机复位到"等停稳",
+       避免沿用 APP_FINISH 遗留的阶段(比如已经 FIN_DONE 就跳过禁用) */
+    if (st == APP_FAULT)
+    {
+        s_app.finish_phase = FIN_WAIT_STOP;
+        s_app.phase_ms     = s_app.state_ms;
+    }
 }
 
 /*==============================================================================
@@ -223,7 +247,9 @@ static bool App_StepDone(const ActStep_t *st)
     {
         case ACT_MOVE:
         case ACT_TURN:
-            return ChassisMotion_IsDone();
+            /* P0-3: 超时/故障也算"已停止", 但**不算成功** ——
+               成功必须用 Succeeded(), 否则降级分支永远不会走 */
+            return ChassisMotion_Succeeded();
 
         case ACT_WAIT:
             return ((HAL_GetTick() - s_app.step_ms) >= (uint32_t)st->p1);
@@ -327,6 +353,15 @@ static bool App_RunScript(void)
         timeout = true;
     }
 
+    /* P0-3: 底盘动作在底层自己结束(超时/无反馈)时, 也按超时处理。
+       脚本里多数 ACT_MOVE 的 timeout_ms=0, 只有底层计时器,
+       若不在这里判失败, 超时会被当成功, ON_TO_FALLBACK/ON_TO_FINISH 永不执行。 */
+    if (!timeout && ((st->type == ACT_MOVE) || (st->type == ACT_TURN)) &&
+        ChassisMotion_IsDone() && !ChassisMotion_Succeeded())
+    {
+        timeout = true;
+    }
+
     if (!timeout && App_StepDone(st))
     {
         /* 记录耗时(供赛后复盘) */
@@ -406,10 +441,9 @@ static void App_SafetyCheck(void)
         return;
     }
 
-    /* 1. 时间硬上限 */
+    /* 1. 时间硬上限(APP_RUN 入口处也会先判一次, 这里覆盖脚本执行期) */
     if ((HAL_GetTick() - s_app.run_start_ms) >= MATCH_SAFE_DEADLINE_MS)
     {
-        App_Log("[app] SAFE DEADLINE -> finish\r\n");
         s_app.fault = APP_FAULT_NONE;
         App_SetState(APP_FINISH);
         return;
@@ -431,13 +465,24 @@ static void App_SafetyCheck(void)
         return;
     }
 
-    /* 4. Geofence: 只做提醒式急停, 不修正 */
+    /* 4. Geofence(P1-2): 处理方式由 GEOFENCE_ACTION 决定
+          (比赛=只记录, 调试=急停), 见 app_config.h 的说明 */
     ChassisMotion_GetPose(&x, &y, &th);
     if (!ChassisMotion_PoseInField(x, y))
     {
+#if (GEOFENCE_ACTION == 1)
         s_app.fault = APP_FAULT_GEOFENCE;
         App_SetState(APP_FAULT);
         return;
+#else
+        /* 只记录一次, 不打断比赛 */
+        if (s_app.geofence_warned == 0U)
+        {
+            s_app.geofence_warned = 1U;
+            App_Log("[app] geofence warn x=%ld y=%ld (仅记录)\r\n",
+                    (long)x, (long)y);
+        }
+#endif
     }
 }
 
@@ -450,16 +495,6 @@ static void App_SafetyCheck(void)
   * @note   由 App_Run 的 APP_FINISH 分支每圈推进一个阶段。
   *         LED 只在所有电机确认停止并禁用之后才点亮。
   */
-typedef enum
-{
-    FIN_PARK_CHASSIS = 0,  /* 底盘减速到 0 */
-    FIN_PARK_LIFT,         /* 升降降回 HOME(可选) */
-    FIN_WAIT_STOP,         /* 等所有执行器确实停稳 */
-    FIN_DISABLE,           /* 禁用电机(舵机保持) */
-    FIN_SETTLE,            /* 等 FINISH_SETTLE_MS */
-    FIN_DONE
-} AppFinishPhase_e;
-
 static void App_DoFinishSequence(void)
 {
     switch ((AppFinishPhase_e)s_app.finish_phase)
@@ -519,6 +554,49 @@ static void App_DoFinishSequence(void)
             break;
     }
 }
+
+/**
+  * @brief  故障收尾(P1-1, 仅比赛模式)
+  * @note   与正常收尾共用同一个阶段机, 但跳过 FIN_PARK_LIFT:
+  *         故障时升降可能已经不可信, 再命令它运动是二次风险。
+  *         阶段: WAIT_STOP -> DISABLE -> SETTLE -> DONE(LED 常亮)
+  */
+#if (RUN_MODE == RUN_MATCH)
+static void App_DoFaultFinish(void)
+{
+    switch ((AppFinishPhase_e)s_app.finish_phase)
+    {
+        case FIN_WAIT_STOP:
+            if (DC_Motor_AllStopped() ||
+                ((HAL_GetTick() - s_app.phase_ms) >= 3000U))
+            {
+                s_app.finish_phase = FIN_DISABLE;
+            }
+            break;
+
+        case FIN_DISABLE:
+            DC_Motor_Enable(DC_MOTOR_FL, false);
+            DC_Motor_Enable(DC_MOTOR_LIFT, false);
+#if (FINISH_HOLD_SERVO == 0)
+            Bucket_Disarm();
+#endif
+            s_app.finish_phase = FIN_SETTLE;
+            s_app.phase_ms     = HAL_GetTick();
+            break;
+
+        case FIN_SETTLE:
+            if ((HAL_GetTick() - s_app.phase_ms) >= FINISH_SETTLE_MS)
+            {
+                s_app.finish_phase = FIN_DONE;
+            }
+            break;
+
+        case FIN_DONE:
+        default:
+            break;
+    }
+}
+#endif /* RUN_MODE == RUN_MATCH */
 
 /*==============================================================================
  * 对外接口
@@ -640,7 +718,9 @@ void App_Init(void)
 
 /* 比赛开始时: 先回零再跑脚本。
    升降的高度全部是"相对回零零点"的, 不回零就往里塞高度值没有意义,
-   所以启动后第一件事是启回零; 回零期间不跑脚本(见 APP_START_HOMING)。 */
+   所以启动后第一件事是启回零; 回零期间不跑脚本(见 APP_START_HOMING)。
+   @note P1-3: LIFT_ZERO_AT_POWERUP==1 时上电即零点, 本函数不参与编译。 */
+#if (LIFT_ZERO_AT_POWERUP == 0)
 static uint8_t App_BeginHoming(void)
 {
     if (Lift_StartHoming() != 0U)
@@ -650,6 +730,7 @@ static uint8_t App_BeginHoming(void)
     s_app.phase_ms = HAL_GetTick();
     return 0U;
 }
+#endif
 
 void App_Run(void)
 {
@@ -682,6 +763,14 @@ void App_Run(void)
                 }
                 else
                 {
+                    /* P1-3: LIFT_ZERO_AT_POWERUP==1 时上电位置就是零点
+                       (设置阶段由队员把平台放到最底), 启动后不再回零,
+                       省掉最多 10s 的比赛时间。仅当配置要求回零时才回零。 */
+#if (LIFT_ZERO_AT_POWERUP == 1)
+                    App_Log("[app] START | zero at powerup, skip homing\r\n");
+                    s_app.homing_wait = 0U;
+                    App_SetState(APP_RUN);
+#else
                     /* 升降必须先建立零点, 否则所有高度指令都不可信 */
                     if (App_BeginHoming() != 0U)
                     {
@@ -695,6 +784,7 @@ void App_Run(void)
                         s_app.homing_wait = 1U;
                         App_SetState(APP_RUN);
                     }
+#endif
                 }
             }
             break;
@@ -702,6 +792,17 @@ void App_Run(void)
 
         case APP_RUN:
         {
+            /* P2-2: 110s 硬截止在**所有** APP_RUN 分支之前判,
+               回零阶段也要受同一约束(虽然 10s 回零超时会先到,
+               但两条路径不该有例外)。 */
+            if ((HAL_GetTick() - s_app.run_start_ms) >= MATCH_SAFE_DEADLINE_MS)
+            {
+                App_Log("[app] SAFE DEADLINE -> finish\r\n");
+                s_app.fault = APP_FAULT_NONE;
+                App_SetState(APP_FINISH);
+                break;
+            }
+
             /* 回零阶段: 期间不跑脚本(升降在被占用), 只等回零结果 */
             if (s_app.homing_wait != 0U)
             {
@@ -759,10 +860,29 @@ void App_Run(void)
                 DC_Motor_EmergencyStopAll();
                 Lift_Stop();
                 Bucket_Disarm();
+                /* P1-1: 故障收尾从"等停稳"开始(急停已经下发) */
+                s_app.finish_phase = FIN_WAIT_STOP;
+                s_app.phase_ms     = HAL_GetTick();
                 App_Log("[app] FAULT code=%u\r\n", (unsigned)s_app.fault);
             }
 
+#if (RUN_MODE == RUN_MATCH)
+            /* P1-1: 比赛模式下 FAULT 也必须走完"结束"流程 ——
+               R25 要求结束时用 LED 表示已结束。急停已在上面做完,
+               这里只等执行器确实停下 -> 禁用 -> 静置 -> 常亮。
+               故障码留在 RAM 里, 赛后用 Debug 版读以区分原因。 */
+            if ((AppFinishPhase_e)s_app.finish_phase == FIN_DONE)
+            {
+                App_LedWrite(1U);         /* 常亮 = 已结束 */
+            }
+            else
+            {
+                App_DoFaultFinish();
+            }
+#else
+            /* 调试模式: 快闪, 方便现场区分"故障"与"正常结束" */
             App_LedWrite((uint8_t)(((HAL_GetTick() - s_app.state_ms) / FAULT_LED_BLINK_MS) & 1U));
+#endif
             break;
         }
 
