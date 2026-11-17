@@ -28,6 +28,7 @@
 |---|---|---|---|
 | USART1 | 文本打印 / 蓝牙可视化 | `app_log.c` 或 `debug_vision.c` | **二者互斥**，见 §6 |
 | USART2 | AT8236 驱动板 | `at8236.c` | 空闲中断接收 |
+| USART3 | **未使用** | — | PB10/PB11 空闲；P1-5 未采纳（蓝牙仍走 USART1） |
 | TIM1 CH1 | 升降电机 PWM 20 kHz | `encoder_motor.c` | PA8 |
 | TIM2 | 升降编码器（TI12 ×4） | `drv_encoder.c` | PA0/PA1，**唯一一路硬件编码器** |
 | TIM3 CH1 | 铲斗舵机 50 Hz | `bucket.c` | PA6 |
@@ -277,13 +278,13 @@ cmake --preset Release && cmake --build --preset Release
 
 | 构建 | FLASH | RAM |
 |---|---|---|
-| Debug（台架，`RUN_DEBUG`） | 45.6 KB / 64 KB（69.6%） | 4.6 KB / 20 KB（22.7%） |
-| Debug（比赛，`RUN_MATCH`） | 57.2 KB / 64 KB（87.3%） | 4.7 KB / 20 KB（22.9%） |
-| Release（台架，`RUN_DEBUG`） | 38.5 KB / 64 KB（58.8%） | 4.6 KB / 20 KB（22.7%） |
-| **Release（比赛，`RUN_MATCH`）← 推荐上场** | **50.0 KB / 64 KB（76.3%）** | 4.7 KB / 20 KB（22.9%） |
+| Debug（台架，`RUN_DEBUG`） | 45.7 KB / 64 KB（69.8%） | 4.6 KB / 20 KB（22.7%） |
+| Debug（比赛，`RUN_MATCH`） | 57.8 KB / 64 KB（88.2%） | 4.7 KB / 20 KB（23.0%） |
+| Release（台架，`RUN_DEBUG`） | 38.6 KB / 64 KB（58.9%） | 4.6 KB / 20 KB（22.7%） |
+| **Release（比赛，`RUN_MATCH`）← 推荐上场** | **50.6 KB / 64 KB（77.3%）** | 4.7 KB / 20 KB（23.0%） |
 
-> **Flash 余量**：Debug+`RUN_MATCH` 占 87.3%（57.2 KB），Release+`RUN_MATCH` 只占 76.3%
-> （50.0 KB）。**比赛请烧 Release**，Debug 版本只用于台架单步。
+> **Flash 余量**：Debug+`RUN_MATCH` 占 88.2%（57.8 KB），Release+`RUN_MATCH` 只占 77.3%
+> （50.6 KB）。**比赛请烧 Release**，Debug 版本只用于台架单步。
 > BOM 差异来自 AT8236 驱动内的 `strtof`：它把 newlib 的浮点解析
 > （`_strtod_l`/`__gethex`）拉进来。若要更多余量，可把 `at8236.c` 的 `strtof`
 > 换成定点解析（当前未做，因为任务书 §0.8 要求不得重写能工作的驱动）。
@@ -297,6 +298,7 @@ cmake --preset Release && cmake --build --preset Release
 # 1. 把 app.h 的 RUN_MODE 改成 RUN_MATCH
 # 2. 确认 debug_config.h 里 8 个分层宏 + DEBUG_VISION_ENABLE 全为 0
 # 3. 确认已拔掉 HC-05
+# 4. （P1-3）确认 LIFT_ZERO_AT_POWERUP=1 时，上电前平台已在最底
 cmake --preset Release && cmake --build --preset Release
 # 产物: build/Release/Example_Car.elf
 # 本工程未配置 hex/bin 后处理; 烧写直接选 .elf (STM32CubeProgrammer / ST-Link 都可)
@@ -353,3 +355,169 @@ cmake --preset Release && cmake --build --preset Release
     先确认驱动板波特率/接线，再确认板子固件是否接受这条指令
     （串口应回 `uploadOK`）。不开上报时 `Chassis` 的反馈恒为 0，
     里程计不走、堵转检测会判"有指令无反馈"。
+12. **`CMOTION_LAG_S = 0.06f`**（P0-4 指令延迟补偿）：需实车标定。
+    标定方法：`chassis_debug` 直行 1000 mm @400 mm/s 各 5 次，
+    若终点误差系统性偏大（冲过头）就加大；偏小（没走够）就减小。
+13. **`LIFT_ZERO_AT_POWERUP = 1`**（P1-3）：每次上电前**必须**把平台放到最底。
+    若平台停在高处上电，所有高度指令都会整体偏高且**不会报错**。
+    不放心就改回 0，用堵转回零（多花最多 10 s 比赛时间）。
+14. **`GEOFENCE_ACTION`**（P1-2）：比赛模式默认 0（只记录），调试模式默认 1（急停）。
+    采用的取舍见 `app_config.h` 中的长注释：无陀螺仪时位置估计误差大，
+    一次误判就整轮归零，代价高于轻微越界本身。**需校内规则确认 R24 的解释。**
+
+---
+
+## 11. v3 审查修复记录（提交 b1a5930 之后的改动）
+
+> 依据 `AGENT_TASK_Warman39_修复v3.md`，按 P0→P1→P2 逐项修复。
+> 每项只改必要代码，未做重构。验证方式写在每项末尾。
+
+### P0-1 急停/停车指令可能丢失 ✅
+
+**改动的函数**：`Chassis_Hold` / `Chassis_Coast` / `Chassis_Task` / `Chassis_SetEnabled`（新增）/
+`DC_Motor_EmergencyStopAll` / `DC_Motor_Enable`
+
+- 运行期发送**只在 `Chassis_Task`（中断上下文）**发生。`Chassis_Hold/Coast` 改为只置
+  `hold_pending` / `coast_pending` 标志与模式，不碰串口。
+- `Chassis_Task` 开头先处理 pending：**发送成功才清标志**，失败下一拍重试；
+  处理 pending 时直接 `return`，保证停车帧优先于速度帧。
+- `CHASSIS_MODE_HOLD` 期间按 `command_period_ms`（50 ms）**周期重发 `$spd:0`**，
+  驱动板丢一帧也会在 50 ms 内被纠正。
+- `STOPPING` 降速到 0 后不再当场发送，改为置 `hold_pending` 走同一通道。
+- 初始化期（`Chassis_Init` 里的那次 hold）仍是直接发送 —— 那时中断节拍还没起来，无竞争。
+
+**验证**：`motor_open_debug` 运行中，主循环每 37 ms 调一次
+`DC_Motor_EmergencyStopAll()` → `DC_Motor_ClearFaults()` → `DC_Motor_Enable(FL,true)`，
+连续 100 次，驱动板必须 100/100 停下；`chassis_stats.cmd_busy` 增长不再导致停车失败。
+
+### P0-2 升降回零必然触发 RANGE 故障 ✅
+
+**改动的函数**：`Lift_UpdateFault` / `Lift_Tick`（清零分支）
+
+- 回零的 `LIFT_HOMING_DOWN` / `LIFT_HOMING_SETTLE` 期间**跳过** RANGE 检查。
+- RANGE 只在 `ELEVATING_STATE_MOVING` 时生效（静止时编码器抖动不升级为故障）。
+- `Elevating_SetZero()` 之后清 `LIFT_FAULT_RANGE` 位。
+- `LIFT_FAULT_TIMEOUT` / `LIFT_FAULT_MOTOR` 不受影响，仍然任何状态都检查。
+
+**验证**：`lift_debug` 中先手动把平台摇到 50 mm 处再上电，回零 → LEVEL1 → HOME
+全程 `Lift_GetFault() == 0`。
+
+### P0-3 底盘动作超时被当成"完成" ✅
+
+**改动的函数**：`ChassisMotion_Succeeded`（新增）/ `App_StepDone` / `App_RunScript`
+
+- 新增 `ChassisMotion_Succeeded()`，只对 `CMOTION_DONE` 返回 true；
+  `ChassisMotion_IsDone()` 语义保持"已停止"（含 TIMEOUT/FAULT）。
+- `App_StepDone` 的 `ACT_MOVE/ACT_TURN` 改用 `Succeeded()`。
+- `App_RunScript` 增加一条：底层动作已结束但未成功 → 按超时处理，
+  直接进入该步的 `on_timeout`（`ON_TO_FALLBACK` / `ON_TO_FINISH`）。
+
+**验证**：脚本里放一步 `ACT_MOVE 3000 mm, timeout 1000 ms, ON_TO_FINISH`，
+必须在 1 s 后进入 `APP_FINISH`，而不是继续下一步。
+
+### P0-4 直线/转向没有减速段 ✅
+
+**改动的函数**：`ChassisMotion_Tick`（两个分支）/ `CMotion_Finish` /
+`ChassisMotionReport_t`（新增 `error` 字段）/ `chassis_debug` 的打印
+
+- 直线：`v_cmd = min(s_speed, sqrtf(2 * CHASSIS_ACC_MMS2 * remaining))`，
+  再减去 `v_cmd * CMOTION_LAG_S` 作为指令延迟补偿，下限 `CMOTION_MIN_V`。
+- 转向：同式，用 `CHASSIS_ACC_DPS2` 与 `CMOTION_MIN_W`。
+- 到位改用 `Chassis_Hold`（P0-1 版本），不再用带斜坡的 `Chassis_Stop`。
+- `report.error = target - achieved`，`chassis_debug` 每步都打印。
+
+**验证**：`chassis_debug` 直行 1000 mm @400 与 @150 mm/s 各 5 次，
+卷尺量终点误差 < 15 mm；原地转 90° 误差 < 3°（编码器口径）。
+
+### P0-5 转角 ≥180° 走不完 ✅
+
+**改动的函数**：`ChassisMotion_Tick`（TURN 分支）/ `CMotion_Begin`
+
+- 新增 `s_turn_accum` / `s_last_yaw`：每拍 `s_turn_accum += WrapDeg(yaw - yaw_prev)`，
+  用**未折返的累积值**判断进度与剩余量，不再用折回到 ±180° 的差值。
+- `chassis_debug` 增加 `+270°` / `-270°` 两步专门验证。
+
+**验证**：`chassis_debug` 原地转 +270° 与 −270° 各一次，都能正常 `DONE`。
+
+### P1-1 比赛中的 FAULT 不应"快闪等待" ✅
+
+**改动的函数**：`App_Run` 的 `APP_FAULT` 分支 / `App_DoFaultFinish`（新增）/
+`App_SetState`
+
+- `RUN_MODE == RUN_MATCH`：FAULT = 急停 → 等停稳 → 禁用 → 静置 `FINISH_SETTLE_MS`
+  → **LED 常亮**（与正常结束一致）。跳过 `FIN_PARK_LIFT`：故障时升降可能已不可信。
+- `RUN_DEBUG` 保持快闪 5 Hz，便于现场区分。
+- 故障码仍保存在 `s_app.fault`（RAM），赛后用 Debug 版读。
+
+**验证**：MATCH 版制造一次人为故障（例如拨开启动键强行进 RUN 后断电编码器），
+LED 应在 `FINISH_SETTLE_MS` 后常亮而不是一直闪。
+
+### P1-2 Geofence 误报 ✅
+
+**改动的函数**：`ChassisMotion_PoseInField` / `App_SafetyCheck` /
+`AppContext_t`（新增 `geofence_warned`）
+
+- 新增 `GEOFENCE_ACTION`：比赛 = 0（只记录一次，不打断），调试 = 1（急停）。
+- 判定改为**向外**：`超出赛道外缘 GEOFENCE_MARGIN_MM` 才算越界
+  （原来是从边缘向内收 80 mm，等于把有效场地缩小了一圈）。
+
+**验证**：`chassis_debug` 开环推到 `x = 2500 mm`，比赛配置下只打印一次 warn；
+调试配置下进 FAULT。
+
+### P1-3 启动后回零占用比赛时间 ✅
+
+**改动的函数**：`Lift_Init` / `Lift_Tick` / `Lift_StartHoming` / `App_Run`（READY→RUN）
+
+- 新增 `LIFT_ZERO_AT_POWERUP`（默认 1）：上电位置即零点，`homing_state` 直接置 `DONE`，
+  比赛中不再回零。置 0 时保留原堵转回零。
+- 回零判据加强：下行阶段累计移动 ≥ `LIFT_HOMING_MOVE_MIN_CNT × 10`（40 计数）后，
+  "500 ms 不动"才算到底；否则判回零失败，避免"12% 占空比推不动"被当成"到底"。
+
+**验证**：`LIFT_ZERO_AT_POWERUP=1` 时按启动键后日志应为
+`START | zero at powerup, skip homing`，不出现 `homing...`。
+
+### P1-4 动作启动的竞态 ✅
+
+**改动的函数**：`CMotion_Begin` / `ChassisMotion_Stop` / `ChassisMotion_Hold`
+
+- `CMotion_Begin` 把所有字段写完，**最后**才写 `s_state = CMOTION_RUN`，
+  并用 `__disable_irq()/__enable_irq()` 包住整段（只做赋值）。
+- `ChassisMotion_Stop/Hold` 同样先落状态再动 Chassis，并关中断保护。
+
+**验证**：`script_debug` 连续跑 50 次"300 mm 前进"，每一步都应完整走完，
+不应出现"瞬间完成、实际没动"的记录。
+
+### P1-5 蓝牙独立串口 ❌ 未采纳
+
+**不做的原因**：已与用户确认——HC-05 保持接 **USART1**，不改 USART3。
+`DEBUG_VISION_ENABLE == 1` 时文本日志仍编译为空实现。
+USART3（PB10/PB11）在 `.ioc` 中保持未占用，后续若改接线可随时启用。
+
+### P2-1 禁用后仍可被下发速度指令 ✅
+
+- 已在 P0-1 一并实现：`Chassis` 新增 `enabled` 字段与 `Chassis_SetEnabled()`。
+  `enabled == 0` 时 `Chassis_Task` **强制 HOLD 并直接 return**，任何速度指令都不会下发。
+  `DC_Motor_Enable(..., false)` 与 `DC_Motor_EmergencyStopAll()` 都会调用它。
+
+### P2-2 回零期间不检查 110 s 截止 ✅
+
+- `App_Run` 的 `APP_RUN` 分支在回零等待**之前**先判 `MATCH_SAFE_DEADLINE_MS`。
+  `App_SafetyCheck` 里保留同一检查（覆盖脚本执行期），日志只在入口处打一次。
+
+### P2-3 浮点 `_Static_assert` 依赖 GCC 扩展 ✅
+
+- 不是 bug，已在 `app_config.h` §11 增加说明：浮点比较不属于 C11 的整型常量表达式，
+  仅 GCC/Clang 接受；换编译器或开 `-Wpedantic` 会告警。当前工程只用 GCC，保留现状。
+
+### P2-4 README 外设表补 USART3
+
+- **不适用**：P1-5 未采纳，USART3 不占用。§1.1 表中已注明 "USART3 未使用"。
+
+### v3 修复后的编译结果
+
+| 配置 | FLASH | RAM | 告警 |
+|---|---|---|---|
+| Debug / `RUN_DEBUG` | 45.7 KB（69.8%） | 4.6 KB（22.7%） | 0 |
+| Debug / `RUN_MATCH` | 57.8 KB（88.2%） | 4.7 KB（23.0%） | 0 |
+| Release / `RUN_DEBUG` | 38.6 KB（58.9%） | 4.6 KB（22.7%） | 0 |
+| **Release / `RUN_MATCH`** | **50.6 KB（77.3%）** | 4.7 KB（23.0%） | 0 |
