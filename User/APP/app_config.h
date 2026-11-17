@@ -146,7 +146,20 @@ extern "C" {
  *============================================================================*/
 #define TRACK_X_MAX              2400.0f
 #define TRACK_Y_MAX              1200.0f
-#define GEOFENCE_MARGIN_MM       80.0f     /* 估计位置离边缘 < 此值 -> 急停 */
+#define GEOFENCE_MARGIN_MM       80.0f     /* 估计位置超出赛道外缘多少才判越界 */
+
+/* 越界处理(P1-2):
+ *   0 = 只记录, 不打断比赛(比赛模式默认)
+ *   1 = 急停进 FAULT(调试模式默认)
+ * 依据: 本车无陀螺仪, 航向只能靠四轮编码器推算, 滑移转向打滑时漂移可达数度,
+ *       位置估计误差随之放大; 而 R24 允许车体伸出赛道外缘。若比赛时按估计值
+ *       急停, 一次误判就整轮归零, 代价远高于"轻微越界"本身。
+ *       调试模式下仍保留急停, 便于台架发现里程计标定错误。 */
+#if (RUN_MODE == RUN_MATCH)
+#define GEOFENCE_ACTION          0
+#else
+#define GEOFENCE_ACTION          1
+#endif
 
 /* 倾倒区 (30x30 DAR 围成, 允许接触: R22) */
 #define DUMP_X_MIN               0.0f
@@ -183,6 +196,14 @@ extern "C" {
  * 当前行程 200mm 时 LIFT_H_LEVEL2 不可达 -> STRATEGY_LEVEL2_ENABLE 必须为 0。 */
 #define LIFT_H_LEVEL2            300.0f
 #define LIFT_ARRIVE_TOL_MM       5.0f    /* L2 判定"真的升到位"的容差 */
+
+/* 零点建立方式(P1-3)
+ *   1 = 上电即零点: 设置阶段由队员把平台手动放到最底, 上电后当前位置记为 0,
+ *       比赛中**不再回零**。G27 允许初始化阶段操作, 可省下最多 10s 比赛时间。
+ *   0 = 启动后堵转回零(旧行为): 低速下行顶到机械下限, 停稳后清零。
+ * @note 置 1 的前提是"每次上电前平台确实在最底"; 若平台停在高处上电,
+ *       所有高度指令都会整体偏高一截, 且不会有任何报错。 */
+#define LIFT_ZERO_AT_POWERUP     1
 
 /*==============================================================================
  * 8. 舵机角度 (度; 0~270 舵机, 500us~2500us)。实测后修改。
@@ -247,7 +268,14 @@ _Static_assert(!APP_CFG_IS_UNSET(LIFT_TRAVEL_MAX_MM), "app_config.h: LIFT_TRAVEL
 #error "本车 AT8236 驱动板为四轮差速底盘, CHASSIS_TYPE 必须是 CHASSIS_DIFF4WD"
 #endif
 
-/* 数值类校验用 _Static_assert: C 预处理器的 #if 不接受浮点常量 */
+/* 数值类校验用 _Static_assert: C 预处理器的 #if 不接受浮点常量。
+ *
+ * 【编译器依赖】下面这些带浮点比较的 _Static_assert **不是标准的整型常量表达式**
+ *   _Static_assert(WHEEL_DIAMETER_MM > 0.0f, ...);
+ * C11 6.6 要求整型常量表达式, 浮点比较只有 GCC 扩展接受(Clang 也接受)。
+ * 在 GCC/arm-none-eabi-gcc 上完全可用; 若换到严格模式的编译器(或开 -Wpedantic),
+ * 这里会告警。真需要可移植时应改成整数比较(例如以 0.1mm 为单位定义参数)。
+ * 保留现状是因为 F103 工程只用 GCC 工具链。 */
 _Static_assert(LIFT_SCREW_LEAD_MM > 0.0f,                  "app_config.h: LIFT_SCREW_LEAD_MM 必须 > 0");
 _Static_assert(TRACK_WIDTH_MM > 0.0f,                      "app_config.h: TRACK_WIDTH_MM 必须 > 0");
 _Static_assert(WHEEL_DIAMETER_MM > 0.0f,                   "app_config.h: WHEEL_DIAMETER_MM 必须 > 0");

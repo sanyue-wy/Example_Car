@@ -17,6 +17,11 @@
 #define LIFT_HOMING_TIMEOUT_MS  8000U      /* 下行总超时, 防止一直顶 */
 #define LIFT_HOMING_SETTLE_MS   200U
 
+/* P1-3: "不动 500ms" 无法区分"到底了"和"12% 占空比根本推不动"。
+   要求下行阶段**累计**移动过 10 倍阈值, 才有资格判"到底";
+   一个计数都没走就开始计时, 应当判回零失败而不是成功。 */
+#define LIFT_HOMING_MOVE_TOTAL_CNT  (LIFT_HOMING_MOVE_MIN_CNT * 10)
+
 /* Private variables ---------------------------------------------------------*/
 
 static Elevating_Object  s_lift;
@@ -26,6 +31,8 @@ static LiftHomingState_e s_homing_state;
 static uint32_t          s_homing_start_ms;
 static uint32_t          s_homing_last_move_ms;
 static int32_t           s_homing_last_cnt;
+static int32_t           s_homing_first_cnt;   /* 下行起点计数(P1-3) */
+static uint8_t           s_homing_moved;       /* 已累计走够 LIFT_HOMING_MOVE_TOTAL_CNT */
 
 static volatile uint8_t  s_fault;
 
@@ -34,6 +41,7 @@ static volatile uint8_t  s_fault;
 static void Lift_UpdateFault(void)
 {
     Elevating_State_e st = Elevating_GetState(&s_lift);
+    float pos;
 
     if (st == ELEVATING_STATE_ERROR)
     {
@@ -43,8 +51,23 @@ static void Lift_UpdateFault(void)
     {
         s_fault |= LIFT_FAULT_MOTOR;
     }
-    if (Elevating_GetPositionMm(&s_lift) < (Elevating_GetMinMm(&s_lift) - 0.5f) ||
-        Elevating_GetPositionMm(&s_lift) > (Elevating_GetMaxMm(&s_lift) + 0.5f))
+
+    /* P0-2: 超程只在一处物理意义上成立 —— 电机正在闭环运动时越界。
+       回零下行时平台本来就会走到"上电零点"以下, 此时判超程是必然误报;
+       静止时编码器抖动几个计数也不应升级成故障。 */
+    if ((s_homing_state == LIFT_HOMING_DOWN) ||
+        (s_homing_state == LIFT_HOMING_SETTLE))
+    {
+        return;
+    }
+    if (st != ELEVATING_STATE_MOVING)
+    {
+        return;
+    }
+
+    pos = Elevating_GetPositionMm(&s_lift);
+    if ((pos < (Elevating_GetMinMm(&s_lift) - 0.5f)) ||
+        (pos > (Elevating_GetMaxMm(&s_lift) + 0.5f)))
     {
         s_fault |= LIFT_FAULT_RANGE;
     }
@@ -69,6 +92,14 @@ uint8_t Lift_Init(void)
     /* 上电当前位置暂定为零点; 正式零点由 Lift_StartHoming 建立 */
     Elevating_SetZero(&s_lift);
     Elevating_Stop(&s_lift);
+
+#if (LIFT_ZERO_AT_POWERUP == 1)
+    /* P1-3: 上电即零点。把状态置为 DONE, 上层(含调试层)看到的就是
+       "零点已建立", 不会再去启动一次堵转回零。 */
+    s_homing_state = LIFT_HOMING_DONE;
+#else
+    s_homing_state = LIFT_HOMING_IDLE;
+#endif
 
     s_ready = 1U;
     return 0U;
@@ -102,8 +133,16 @@ void Lift_Tick(void)
             s_homing_last_move_ms  = HAL_GetTick();
         }
 
-        /* 到达机械下限: 长时间不动 */
-        if ((HAL_GetTick() - s_homing_last_move_ms) >= LIFT_HOMING_STALL_MS)
+        /* P1-3: 只有"确实下行过一段"才允许把静止解释为到底 */
+        if (!s_homing_moved &&
+            (abs((int)(cnt - s_homing_first_cnt)) >= LIFT_HOMING_MOVE_TOTAL_CNT))
+        {
+            s_homing_moved = 1U;
+        }
+
+        /* 到达机械下限: 长时间不动, 且此前确实动过 */
+        if (((HAL_GetTick() - s_homing_last_move_ms) >= LIFT_HOMING_STALL_MS) &&
+            (s_homing_moved != 0U))
         {
             Elevating_Stop(&s_lift);
             s_homing_state = LIFT_HOMING_SETTLE;
@@ -130,6 +169,8 @@ void Lift_Tick(void)
     {
         Elevating_Stop(&s_lift);
         Elevating_SetZero(&s_lift);
+        /* P0-2: 零点重建后, 回零过程中若曾越界, 该判定已失效 —— 清掉 */
+        s_fault &= (uint8_t)~LIFT_FAULT_RANGE;
         s_homing_state = LIFT_HOMING_DONE;
     }
 }
@@ -154,6 +195,8 @@ uint8_t Lift_StartHoming(void)
     s_homing_start_ms     = HAL_GetTick();
     s_homing_last_move_ms = HAL_GetTick();
     s_homing_last_cnt     = ENCODER_GetCount(&s_lift.motor.encoder);
+    s_homing_first_cnt    = s_homing_last_cnt;
+    s_homing_moved        = 0U;
     return 0U;
 #endif
 }
