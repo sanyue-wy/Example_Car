@@ -111,9 +111,17 @@ void ChassisMotion_Hold(void);
 void ChassisMotion_Tick(void);
 
 /**
- * @brief  动作是否结束(含 DONE/TIMEOUT/FAULT)
+ * @brief  动作是否已停止(含 DONE/TIMEOUT/FAULT/IDLE)
+ * @note   只表示"不再动"; 判断是否达成目标请用 ChassisMotion_Succeeded()
  */
 bool ChassisMotion_IsDone(void);
+
+/**
+ * @brief  最近一次动作是否**成功达成**目标(仅 CMOTION_DONE)
+ * @note  P0-3: 脚本执行器必须用这个, 不能用 IsDone ——
+ *        超时/故障也是"已停止", 若当作成功就永远不会走降级分支。
+ */
+bool ChassisMotion_Succeeded(void);
 
 ChassisMotionState_e ChassisMotion_GetState(void);
 
@@ -126,6 +134,7 @@ typedef struct
     ChassisMotionState_e state;
     float    target;        /* 目标距离/角度 */
     float    achieved;      /* 实际走到的距离/角度(取结束时的估计量) */
+    float    error;         /* target - achieved, 正=没走够(P0-4 终点误差) */
     uint32_t elapsed_ms;
 } ChassisMotionReport_t;
 

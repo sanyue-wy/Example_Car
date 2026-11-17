@@ -18,6 +18,12 @@
 #define CMOTION_MIN_W         5.0f
 #define CMOTION_DEFAULT_TMO   15000U   /* 未给超时时的兜底 */
 
+/* P0-4: 指令延迟补偿(s) —— 从"算出目标速度"到"轮子真的跟上"的时间。
+   包含 5ms 控制节拍 + 50ms 驱动板指令周期 + 驱动板速度环响应。
+   补偿方式: 用 v_cmd * CMOTION_LAG_S 先从剩余距离里扣掉,
+   相当于提前一点开始减速。  标注 TUNE: 需实车标定。 */
+#define CMOTION_LAG_S         0.06f
+
 /* Private variables ---------------------------------------------------------*/
 
 static Chassis_Object *s_chassis;
@@ -29,6 +35,11 @@ static float    s_target;        /* 距离 mm 或角度 deg */
 static float    s_speed;         /* mm/s 或 deg/s */
 static float    s_start_x, s_start_y, s_start_yaw;   /* 本动作起点(里程计原始值) */
 static float    s_progress;      /* 已完成的距离/角度 */
+
+/* P0-5: 转角按"每拍增量累积", 不折回 ±180。
+   否则目标 270deg / -200deg 永远达不到, 只能靠超时结束。 */
+static float    s_turn_accum;
+static float    s_last_yaw;
 
 /* SetPose 设定的起点偏置: GetPose = 里程计增量 + 偏置。
    与 s_start_* 分开存放 —— 后者每个动作都会被覆盖。 */
@@ -80,8 +91,13 @@ static void CMotion_Begin(ChassisMotion_e action, float target, float speed,
 
     ChassisMotion_GetPose(&x, &y, &yaw);
 
+    /* P1-4: 先写完所有字段, 最后才写 s_state。
+       ChassisMotion_Tick 在 5ms 中断里跑, 主循环在这里被抢占时
+       若 s_state 已经等于 RUN, 中断会用上一动作的旧目标立刻判完成。
+       整段只用赋值, 关中断的开销可以接受。 */
+    __disable_irq();
+
     s_action      = action;
-    s_state       = CMOTION_RUN;
     s_target      = target;
     s_speed       = speed;
     s_start_x     = x;
@@ -96,11 +112,20 @@ static void CMotion_Begin(ChassisMotion_e action, float target, float speed,
 
     s_heading_ref_deg = yaw;
 
+    /* P0-5: 转角累积量从 0 开始, 起点航向作为第一个参考 */
+    s_turn_accum  = 0.0f;
+    s_last_yaw    = yaw;
+
     s_report.action     = action;
     s_report.state      = CMOTION_RUN;
     s_report.target     = target;
     s_report.achieved   = 0.0f;
+    s_report.error      = 0.0f;
     s_report.elapsed_ms = 0U;
+
+    s_state = CMOTION_RUN;      /* 最后写 */
+
+    __enable_irq();
 }
 
 /**
@@ -116,7 +141,10 @@ static void CMotion_Finish(ChassisMotionState_e state)
 
     if (s_chassis != NULL)
     {
-        (void)Chassis_Stop(s_chassis);
+        /* P0-4: 已经靠减速段把速度降到最低, 用硬停而不是带斜坡的 Stop,
+           避免"到位后再滑 0.2s" 的额外超程。
+           Chassis_Hold 只置标志(P0-1), 真正发送在 Chassis_Task。 */
+        (void)Chassis_Hold(s_chassis);
     }
 }
 
@@ -166,12 +194,17 @@ void ChassisMotion_GetPose(float *x_mm, float *y_mm, float *theta_deg)
     }
 }
 
+/**
+  * @brief  估计位置是否在赛道范围内(向外判, 而不是向内收边距)
+  * @note   P1-2: R24 允许车体伸出赛道外缘, 所以判定条件是
+  *         "超出外缘 GEOFENCE_MARGIN_MM 以上", 而不是"距离边缘不足 80mm"。
+  */
 bool ChassisMotion_PoseInField(float x_mm, float y_mm)
 {
-    return (x_mm >= GEOFENCE_MARGIN_MM) &&
-           (x_mm <= (TRACK_X_MAX - GEOFENCE_MARGIN_MM)) &&
-           (y_mm >= GEOFENCE_MARGIN_MM) &&
-           (y_mm <= (TRACK_Y_MAX - GEOFENCE_MARGIN_MM));
+    return (x_mm >= -GEOFENCE_MARGIN_MM) &&
+           (x_mm <= (TRACK_X_MAX + GEOFENCE_MARGIN_MM)) &&
+           (y_mm >= -GEOFENCE_MARGIN_MM) &&
+           (y_mm <= (TRACK_Y_MAX + GEOFENCE_MARGIN_MM));
 }
 
 uint8_t ChassisMotion_MoveStraight(float dist_mm, float v_mms, uint32_t timeout_ms)
@@ -233,10 +266,20 @@ void ChassisMotion_Stop(void)
     {
         return;
     }
+    /* P1-4: 先落新状态, 再动 Chassis; 全程关中断, 防止 5ms 中断
+       在两行之间用旧的 s_action 继续算一拍 */
+    __disable_irq();
     if (s_state == CMOTION_RUN)
     {
-        CMotion_Finish(CMOTION_DONE);
+        s_state        = CMOTION_DONE;
+        s_report.state = CMOTION_DONE;
+        s_report.achieved   = s_progress;
+        s_report.error      = s_target - s_progress;
+        s_report.elapsed_ms = HAL_GetTick() - s_start_ms;
+        s_action       = CMOVE_IDLE;
     }
+    __enable_irq();
+
     (void)Chassis_Stop(s_chassis);
 }
 
@@ -246,8 +289,11 @@ void ChassisMotion_Hold(void)
     {
         return;
     }
-    s_state = CMOTION_IDLE;
+    __disable_irq();
+    s_state  = CMOTION_IDLE;
     s_action = CMOVE_IDLE;
+    __enable_irq();
+
     (void)Chassis_Hold(s_chassis);
 }
 
@@ -282,14 +328,29 @@ void ChassisMotion_Tick(void)
             /* 沿起点朝向的投影 = 有符号前进距离 */
             float rad = s_start_yaw * CMOTION_DEG2RAD;
             float along = dx * cosf(rad) + dy * sinf(rad);
+            float dir = CMotion_Sign(s_target);
+            float remaining = (s_target - along) * dir;   /* 沿运动方向的剩余量 */
+            float v_cmd;
 
             s_progress = along;
 
-            if (CMotion_Sign(s_target) * (s_target - along) <= CHASSIS_POS_TOL_MM)
+            if (remaining <= CHASSIS_POS_TOL_MM)
             {
+                s_report.error = s_target - along;
                 CMotion_Finish(CMOTION_DONE);
                 return;
             }
+
+            /* P0-4: 梯形速度 —— 接近目标时按 v=sqrt(2*a*s) 减速,
+               并扣掉指令延迟对应的"还会多走"的距离 */
+            v_cmd = s_speed;
+            {
+                float decel = sqrtf(2.0f * CHASSIS_ACC_MMS2 * remaining);
+                if (decel < v_cmd) { v_cmd = decel; }
+            }
+            v_cmd -= v_cmd * CMOTION_LAG_S;    /* 等效提前量 */
+            if (v_cmd < CMOTION_MIN_V) { v_cmd = CMOTION_MIN_V; }
+            if (v_cmd > s_speed)       { v_cmd = s_speed; }
 
             /* 航向保持: 编码器航向误差 -> 角速度修正 */
             err   = CMotion_WrapDeg(s_heading_ref_deg - yaw);
@@ -297,23 +358,42 @@ void ChassisMotion_Tick(void)
             if (w_cmd > HEADING_HOLD_MAX_DPS)  { w_cmd = HEADING_HOLD_MAX_DPS; }
             if (w_cmd < -HEADING_HOLD_MAX_DPS) { w_cmd = -HEADING_HOLD_MAX_DPS; }
 
-            (void)Chassis_SetVelocity(s_chassis, CMotion_Sign(s_target) * s_speed, w_cmd);
+            (void)Chassis_SetVelocity(s_chassis, dir * v_cmd, w_cmd);
             break;
         }
 
         case CMOVE_TURN:
         {
-            float dth = CMotion_WrapDeg(yaw - s_start_yaw);
+            /* P0-5: 累积未折返的转角 */
+            float dnow = CMotion_WrapDeg(yaw - s_last_yaw);
+            float dir  = CMotion_Sign(s_target);
+            float remaining;
+            float w_cmd_t;
 
-            s_progress = dth;
+            s_last_yaw = yaw;
+            s_turn_accum = s_turn_accum + dnow;
 
-            if (CMotion_Sign(s_target) * (s_target - dth) <= CHASSIS_ANG_TOL_DEG)
+            s_progress = s_turn_accum;
+            remaining  = (s_target - s_turn_accum) * dir;
+
+            if (remaining <= CHASSIS_ANG_TOL_DEG)
             {
+                s_report.error = s_target - s_turn_accum;
                 CMotion_Finish(CMOTION_DONE);
                 return;
             }
 
-            (void)Chassis_SetVelocity(s_chassis, 0.0f, CMotion_Sign(s_target) * s_speed);
+            /* P0-4: 转向同样减速 */
+            w_cmd_t = s_speed;
+            {
+                float decel = sqrtf(2.0f * CHASSIS_ACC_DPS2 * remaining);
+                if (decel < w_cmd_t) { w_cmd_t = decel; }
+            }
+            w_cmd_t -= w_cmd_t * CMOTION_LAG_S;
+            if (w_cmd_t < CMOTION_MIN_W) { w_cmd_t = CMOTION_MIN_W; }
+            if (w_cmd_t > s_speed)       { w_cmd_t = s_speed; }
+
+            (void)Chassis_SetVelocity(s_chassis, 0.0f, dir * w_cmd_t);
             break;
         }
 
@@ -325,12 +405,22 @@ void ChassisMotion_Tick(void)
     }
 }
 
+/**
+  * @brief  当前动作是否已停止(含正常完成 / 超时 / 故障)
+  * @note   P0-3: 这只是"不再动"的语义, 不能用来判断"达成目标"。
+  *         判成功请用 ChassisMotion_Succeeded()。
+  */
 bool ChassisMotion_IsDone(void)
 {
     return (s_state == CMOTION_DONE) ||
            (s_state == CMOTION_TIMEOUT) ||
            (s_state == CMOTION_FAULT) ||
            (s_state == CMOTION_IDLE);
+}
+
+bool ChassisMotion_Succeeded(void)
+{
+    return (s_state == CMOTION_DONE);
 }
 
 ChassisMotionState_e ChassisMotion_GetState(void)
