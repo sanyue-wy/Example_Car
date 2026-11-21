@@ -61,7 +61,7 @@
  *    比赛中必须为 0, 且拔掉 HC-05 模块(规则 FAQ3/4, R21)。
  *============================================================================*/
 #ifndef DEBUG_VISION_ENABLE
-#define DEBUG_VISION_ENABLE     0
+#define DEBUG_VISION_ENABLE     1
 #endif
 
 /* 可视化测试场景(仅 DEBUG_VISION_ENABLE==1 时生效, 定义在 debug_vision.h) */
