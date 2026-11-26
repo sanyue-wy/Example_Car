@@ -57,6 +57,10 @@ static uint8_t Chassis_SendWheels(Chassis_Object *chassis, uint32_t now_ms);
 static uint8_t Chassis_SendHold(Chassis_Object *chassis, uint32_t now_ms);
 static void    Chassis_UpdateFeedback(Chassis_Object *chassis, uint32_t now_ms);
 static void    Chassis_WrapYaw(float *yaw_rad);
+static uint8_t Chassis_WheelMapValid(const Chassis_Config_t *cfg);
+static void    Chassis_MapToChannel(const Chassis_Config_t *cfg,
+                                    const float logical[CHASSIS_MOTOR_NUM],
+                                    float physical[CHASSIS_MOTOR_NUM]);
 
 /* Private functions ----------------------------------------------------------*/
 
@@ -73,6 +77,43 @@ static float Chassis_Abs(float value)
 static float Chassis_WheelSign(const Chassis_Object *chassis, uint8_t index)
 {
   return (((chassis->cfg.invert_mask >> index) & 0x01U) != 0U) ? -1.0f : 1.0f;
+}
+
+/**
+  * @brief  wheel_map 必须是 0~3 的一个排列, 否则两侧轮会互相覆盖
+  */
+static uint8_t Chassis_WheelMapValid(const Chassis_Config_t *cfg)
+{
+  uint8_t seen = 0U;
+
+  for (uint8_t i = 0U; i < CHASSIS_MOTOR_NUM; i++)
+  {
+    uint8_t ch = cfg->wheel_map[i];
+
+    if (ch >= CHASSIS_MOTOR_NUM)
+    {
+      return 0U;
+    }
+    if ((seen & (uint8_t)(1U << ch)) != 0U)
+    {
+      return 0U;
+    }
+    seen |= (uint8_t)(1U << ch);
+  }
+  return 1U;
+}
+
+/**
+  * @brief  逻辑轮序 -> 物理通道: physical[wheel_map[i]] = logical[i]
+  */
+static void Chassis_MapToChannel(const Chassis_Config_t *cfg,
+                                 const float logical[CHASSIS_MOTOR_NUM],
+                                 float physical[CHASSIS_MOTOR_NUM])
+{
+  for (uint8_t i = 0U; i < CHASSIS_MOTOR_NUM; i++)
+  {
+    physical[cfg->wheel_map[i]] = logical[i];
+  }
 }
 
 /**
@@ -182,6 +223,7 @@ static void Chassis_ComputeWheels(const Chassis_Object *chassis, float v_mmps,
 static uint8_t Chassis_SendWheels(Chassis_Object *chassis, uint32_t now_ms)
 {
   float wheel_mmps[CHASSIS_MOTOR_NUM];
+  float channel_mmps[CHASSIS_MOTOR_NUM];
 
   if ((chassis->ops == NULL) || (chassis->ops->set_wheel_speeds == NULL))
   {
@@ -195,7 +237,10 @@ static uint8_t Chassis_SendWheels(Chassis_Object *chassis, uint32_t now_ms)
     chassis->wheel_cmd[i] = wheel_mmps[i];
   }
 
-  if (chassis->ops->set_wheel_speeds(chassis->motor_ctx, wheel_mmps) != 0U)
+  /* 逻辑轮序 -> 驱动板通道(实车接线与板子丝印不一致时由 wheel_map 吸收) */
+  Chassis_MapToChannel(&chassis->cfg, wheel_mmps, channel_mmps);
+
+  if (chassis->ops->set_wheel_speeds(chassis->motor_ctx, channel_mmps) != 0U)
   {
     chassis->stats.cmd_busy++;
     return 1U;
@@ -257,6 +302,19 @@ static void Chassis_UpdateFeedback(Chassis_Object *chassis, uint32_t now_ms)
     chassis->feedback_valid = 0U;
     chassis->stats.feedback_lost++;
     return;
+  }
+
+  /* 反馈按物理通道上报, 先转回逻辑轮序, 后续里程计/遥测所有下标统一 */
+  {
+    Chassis_Feedback_t raw = fb;
+
+    for (uint8_t i = 0U; i < CHASSIS_MOTOR_NUM; i++)
+    {
+      uint8_t ch = chassis->cfg.wheel_map[i];
+
+      fb.wheel_speed_mmps[i] = raw.wheel_speed_mmps[ch];
+      fb.wheel_count[i]      = raw.wheel_count[ch];
+    }
   }
 
   chassis->feedback = fb;
@@ -361,6 +419,10 @@ void Chassis_DefaultConfig(Chassis_Config_t *cfg)
   cfg->linear_deadband_mmps = 5.0f;
   cfg->angular_deadband_dps = 2.0f;
   cfg->invert_mask          = 0x00U;
+  for (uint8_t i = 0U; i < CHASSIS_MOTOR_NUM; i++)
+  {
+    cfg->wheel_map[i] = i;   /* 默认: 逻辑轮序 = 驱动板 M1~M4 */
+  }
   cfg->command_period_ms    = 50U;
   cfg->command_timeout_ms   = 0U;   /* 默认关闭租约, 需要时由上层打开 */
   cfg->feedback_timeout_ms  = 500U;
@@ -390,7 +452,7 @@ uint8_t Chassis_Init(Chassis_Object *chassis, const Chassis_Config_t *cfg,
       !(cfg->max_wheel_mmps > 0.0f) ||
       !(cfg->linear_accel_mmps2 > 0.0f) || !(cfg->angular_accel_dps2 > 0.0f) ||
       (cfg->linear_deadband_mmps < 0.0f) || (cfg->angular_deadband_dps < 0.0f) ||
-      (cfg->command_period_ms == 0U))
+      (cfg->command_period_ms == 0U) || (Chassis_WheelMapValid(cfg) == 0U))
   {
     return (uint8_t)CHASSIS_ERR_PARAM;
   }

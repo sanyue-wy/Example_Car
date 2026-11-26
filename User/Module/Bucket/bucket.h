@@ -34,9 +34,9 @@ typedef enum
 } BucketPose_e;
 
 /**
- * @brief  初始化: 绑定 PWM 通道并**停在 STOW 角度但不使能输出**
+ * @brief  初始化: 绑定 PWM 通道并停在 BUCKET_ANG_INIT(默认调零 135°)
  * @note   内部仍会 PWM_Channel_Init(它会启动定时器输出), 因此调用后立刻写
- *         STOW 脉宽并置 output_enabled = 0 —— 见 Bucket_Arm 的说明。
+ *         BUCKET_ANG_INIT 脉宽并置 output_enabled = 0 —— 见 Bucket_Arm 的说明。
  *         App_Init 阶段电机/舵机不得"执行功能", 但舵机保持在固定角度不视为功能动作;
  *         若校内规则更严格, 把 BUCKET_SAFE_OUTPUT_AT_INIT 置 0 并让舵机上电即断开。
  */
@@ -67,6 +67,15 @@ uint8_t Bucket_SetPose(BucketPose_e pose);
  * @note   p2 = 0 时用 BUCKET_MOVE_MS
  */
 uint8_t Bucket_SetPoseSlow(BucketPose_e pose, uint16_t ms);
+
+/**
+ * @brief  直接设置目标角度(0~270, 非阻塞, 由 Bucket_IsDone 查询)
+ * @note   调试/舵机调零用: 不走姿态表。之后 Bucket_GetPose() 返回
+ *         BUCKET_POSE_NUM, 表示当前是"自定义角度"。
+ * @param  deg 目标角度(度), 135 对应 1500us(行程中点)
+ * @retval 0 已接受; 1 未 Arm; 2 参数错误
+ */
+uint8_t Bucket_SetAngle(uint16_t deg);
 
 /**
  * @brief  动作是否结束(按固定时间判到位, 舵机无反馈)

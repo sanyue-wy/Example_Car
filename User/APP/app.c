@@ -105,6 +105,9 @@ static uint8_t            s_chassis_ok;
 /* 初始化期硬件缺失标志: CubeMX 未配置启动键/LED 引脚时置 1 */
 static uint8_t            s_hw_missing;
 
+/* 逻辑轮序 -> 驱动板通道(实车接线), 定义见 chassis_map.h */
+static const uint8_t      s_wheel_map[CHASSIS_MOTOR_NUM] = CHASSIS_WHEEL_MAP;
+
 /*==============================================================================
  * 小工具
  *============================================================================*/
@@ -635,6 +638,7 @@ void App_InitDrivers(void)
         ch_cfg.max_angular_dps    = CHASSIS_W_MAX_DPS;
         ch_cfg.linear_accel_mmps2 = CHASSIS_ACC_MMS2;
         ch_cfg.angular_accel_dps2 = CHASSIS_ACC_DPS2;
+        memcpy(ch_cfg.wheel_map, s_wheel_map, sizeof(ch_cfg.wheel_map));
 
         if (Chassis_Init(&s_chassis, &ch_cfg, Chassis_GetAT8236Ops(), &s_board) == 0U)
         {
@@ -646,8 +650,43 @@ void App_InitDrivers(void)
                AT8236_SetPid 注释), 不开则 Chassis 拿不到轮速/计数:
                  里程计恒为 0 -> 直行动作永远走不完;
                  堵转检测看到"有指令无反馈" -> 误判 FAULT。
-               不开 delta($MTEP): 115200 上三类全开占用过高, 累计值已够用。 */
-            (void)AT8236_SetUpload(&s_board, 1U, 0U, 1U);
+               不开 delta($MTEP): 115200 上三类全开占用过高, 累计值已够用。
+
+               【必须带重试】上一行 Chassis_Init() 刚下发过 $spd:0,0,0,0#,
+               UART 是非阻塞发送, 帧还没发完时再发 $upload 会被 AT8236_Send
+               判 BUSY 直接丢掉, 而全工程没有第二处补发 —— 结果就是上报
+               永久关闭、$MAll/$MSPD 一帧都收不到、四个轮编码器恒为 0。
+               另外驱动板上电比 MCU 慢, 太早发的指令也可能没人收。
+               所以这里"发 -> 等上报帧真的出现"重试 3 轮, 而不是只发一次。 */
+            for (uint8_t attempt = 0U; attempt < 3U; attempt++)
+            {
+                uint32_t f0;
+                uint32_t t0;
+                uint8_t  up_ok = 0U;
+
+                if (AT8236_SetUpload(&s_board, 1U, 0U, 1U) != 0U)
+                {
+                    HAL_Delay(2U);   /* 等上一帧 $spd:0 发完再重试 */
+                    continue;
+                }
+
+                /* 40ms 内出现任意 $MAll/$MSPD 帧即认为上报已开 */
+                f0 = s_board.stats.total_frames + s_board.stats.speed_frames;
+                t0 = HAL_GetTick();
+                while ((HAL_GetTick() - t0) < 40U)
+                {
+                    if ((s_board.stats.total_frames + s_board.stats.speed_frames) > f0)
+                    {
+                        up_ok = 1U;
+                        break;
+                    }
+                }
+                if (up_ok != 0U)
+                {
+                    break;
+                }
+                HAL_Delay(20U);      /* 驱动板可能还没起来, 隔开再补发 */
+            }
         }
     }
 
@@ -931,6 +970,11 @@ uint32_t   App_GetElapsedMs(void)
 const Chassis_Object *App_GetChassis(void)
 {
     return s_chassis_ok ? &s_chassis : NULL;
+}
+
+AT8236_Object *App_GetBoard(void)
+{
+    return s_chassis_ok ? &s_board : NULL;
 }
 
 const Elevating_Object *App_GetLift(void)

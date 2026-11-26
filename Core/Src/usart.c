@@ -21,7 +21,9 @@
 #include "usart.h"
 
 /* USER CODE BEGIN 0 */
-
+/* 波特率集中配置(见 User/APP/uart_config.h):
+   切换 USB-TTL 文本调试 / DX-BT24 蓝牙时只改那边的宏 */
+#include "uart_config.h"
 /* USER CODE END 0 */
 
 UART_HandleTypeDef huart1;
@@ -40,7 +42,7 @@ void MX_USART1_UART_Init(void)
 
   /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
+  huart1.Init.BaudRate = UART_DEBUG_BAUD;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_NONE;
@@ -52,7 +54,16 @@ void MX_USART1_UART_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USART1_Init 2 */
-
+  /* CubeMX 重新生成会把上面的字面量改回 115200; 这里按宏校正一次,
+     值相同则跳过, 不会重复初始化。 */
+  if (huart1.Init.BaudRate != UART_DEBUG_BAUD)
+  {
+    huart1.Init.BaudRate = UART_DEBUG_BAUD;
+    if (HAL_UART_Init(&huart1) != HAL_OK)
+    {
+      Error_Handler();
+    }
+  }
   /* USER CODE END USART1_Init 2 */
 
 }
@@ -69,7 +80,7 @@ void MX_USART2_UART_Init(void)
 
   /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
+  huart2.Init.BaudRate = UART_BOARD_BAUD;
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
   huart2.Init.StopBits = UART_STOPBITS_1;
   huart2.Init.Parity = UART_PARITY_NONE;
@@ -81,7 +92,15 @@ void MX_USART2_UART_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USART2_Init 2 */
-
+  /* 同 USART1: CubeMX 重新生成后按宏校正波特率 */
+  if (huart2.Init.BaudRate != UART_BOARD_BAUD)
+  {
+    huart2.Init.BaudRate = UART_BOARD_BAUD;
+    if (HAL_UART_Init(&huart2) != HAL_OK)
+    {
+      Error_Handler();
+    }
+  }
   /* USER CODE END USART2_Init 2 */
 
 }

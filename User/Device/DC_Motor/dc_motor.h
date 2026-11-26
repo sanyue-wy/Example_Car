@@ -34,10 +34,13 @@ struct Elevating_Object;
  *============================================================================*/
 typedef enum
 {
-    DC_MOTOR_FL   = 0,   /* 左前轮(经 AT8236 M1) */
-    DC_MOTOR_FR   = 1,   /* 右前轮(经 AT8236 M3) */
-    DC_MOTOR_RL   = 2,   /* 左后轮(经 AT8236 M2) */
-    DC_MOTOR_RR   = 3,   /* 右后轮(经 AT8236 M4) */
+    /* 编号必须与 chassis 逻辑轮序一致: 0=左前 1=左后 2=右前 3=右后;
+       DC_Motor_GetState 直接用 id 索引底盘轮速, 顺序错会读错轮。
+       实车通道映射见 chassis_map.h (左前=M4 左后=M3 右前=M1 右后=M2)。 */
+    DC_MOTOR_FL   = 0,   /* 左前轮(经 AT8236 M4) */
+    DC_MOTOR_RL   = 1,   /* 左后轮(经 AT8236 M3) */
+    DC_MOTOR_FR   = 2,   /* 右前轮(经 AT8236 M1) */
+    DC_MOTOR_RR   = 3,   /* 右后轮(经 AT8236 M2) */
     DC_MOTOR_LIFT = 4,   /* 升降电机(PWM 直驱) */
     DC_MOTOR_NUM  = 5
 } DC_MotorId_e;

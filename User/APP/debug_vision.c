@@ -397,7 +397,7 @@ static void DebugVision_SendTelemetry(void)
     car[2] = s_read.car_yaw;
     btdbg_send_telemetry(BTDBG_CH_CAR, car, 3U);
 
-    /* CH_MOTOR: FL/FR/RL/RR 实际速度 + 升降位置 */
+    /* CH_MOTOR: LF/LR/RF/RR 实际速度(chassis 逻辑轮序) + 升降位置 */
     motor[0] = s_read.wheel_actual[0];
     motor[1] = s_read.wheel_actual[1];
     motor[2] = s_read.wheel_actual[2];

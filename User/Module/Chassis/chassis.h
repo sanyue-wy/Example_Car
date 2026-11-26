@@ -18,7 +18,7 @@ extern "C" {
 
 /* Exported macros -----------------------------------------------------------*/
 
-#define CHASSIS_MOTOR_NUM        4U   /* M1~M4: 左前/左后/右前/右后 */
+#define CHASSIS_MOTOR_NUM        4U   /* 逻辑轮序: 左前/左后/右前/右后 */
 
 /**
   * 是否编译内置的 AT8236 适配器。
@@ -48,8 +48,11 @@ extern "C" {
   * 坐标/符号约定(全模块统一, 适配器负责把物理接线差异吸收到 invert_mask):
   *   - x 向前, y 向左, yaw 逆时针为正;
   *   - v > 0 前进, ω > 0 左转(逆时针, 右轮快/左轮慢);
-  *   - 轮序: 0=M1 左前, 1=M2 左后, 2=M3 右前, 3=M4 右后;
-  *     左侧轮 = (M1+M2)/2, 右侧轮 = (M3+M4)/2。
+  *   - 逻辑轮序: 0=左前, 1=左后, 2=右前, 3=右后;
+  *     左侧轮 = (0+1)/2, 右侧轮 = (2+3)/2;
+  *   - 逻辑轮序 -> 驱动板物理通道由 cfg.wheel_map 指定(物理通道 0=M1..3=M4),
+  *     实车接线与板子丝印不一致时只改映射, 不动运动学;
+  *     本车实测映射见 chassis_map.h 的 CHASSIS_WHEEL_MAP。
   *
   * 硬件前提:
   *   - 本工程电机 JCA25-370-103K: 67mm 轮, 11 线编码器, 减速比 103,
@@ -95,11 +98,12 @@ typedef struct
 
 /**
   * @brief  电机总线抽象接口(由使用方实现)
-  * @note   set_wheel_speeds: wheel[i] 已按底盘约定换向, 正值=底盘前进方向;
-  *         返回 0 成功, 非 0 失败/忙
+  * @note   set_wheel_speeds: wheel[i] 是**物理通道**顺序(已按 cfg.wheel_map 重排),
+  *         且已按 invert_mask 换向, 正值=底盘前进方向; 返回 0 成功, 非 0 失败/忙
   *         hold: 主动刹车/锁轮(对应 $spd:0)
   *         coast: 输出断开(对应 $pwm:0)
-  *         get_feedback: 填原始轮速/计数, 返回 1 表示反馈有效; 可为 NULL
+  *         get_feedback: 按物理通道顺序填原始轮速/计数, 返回 1 表示反馈有效;
+  *         可为 NULL(核心会自动转回逻辑轮序)
   */
 typedef struct
 {
@@ -128,7 +132,8 @@ typedef struct
   float    linear_deadband_mmps;   /* 线速度输入死区 */
   float    angular_deadband_dps;   /* 角速度输入死区 */
 
-  uint8_t  invert_mask;            /* 逐轮换向, bit0=M1 ... bit3=M4 */
+  uint8_t  invert_mask;            /* 逐轮换向, bit0=左前 ... bit3=右后(逻辑轮序) */
+  uint8_t  wheel_map[CHASSIS_MOTOR_NUM]; /* 逻辑轮序 -> 物理通道, 0=M1 ... 3=M4 */
 
   uint32_t command_period_ms;      /* 控制指令下发周期(驱动板保持型指令) */
   uint32_t command_timeout_ms;     /* 目标刷新租约, 超时自动停车; 0=关闭 */

@@ -77,8 +77,8 @@ void Bucket_Init(void)
         return;
     }
 
-    /* 先写安全角度, 保持舵机不抖 */
-    Bucket_WriteAngle((uint16_t)BUCKET_ANG_SAFE);
+    /* 先写上电初始角度(默认 BUCKET_ANG_ZERO 调零位), 保持舵机不抖 */
+    Bucket_WriteAngle((uint16_t)BUCKET_ANG_INIT);
     s_inited = 1U;
 
 #if (BUCKET_SAFE_OUTPUT_AT_INIT == 0)
@@ -111,18 +111,18 @@ void Bucket_Disarm(void)
     }
 }
 
-uint8_t Bucket_SetPose(BucketPose_e pose)
+uint8_t Bucket_SetAngle(uint16_t deg)
 {
-    if (s_inited == 0U)  { return 2U; }
-    if (s_armed == 0U)   { return 1U; }
-    if (pose >= BUCKET_POSE_NUM) { return 2U; }
+    if (s_inited == 0U) { return 2U; }
+    if (s_armed == 0U)  { return 1U; }
+    if (deg > 270U)     { return 2U; }
 
-    s_pose        = pose;
-    s_angle_from  = s_angle_now;
-    s_angle_to    = Bucket_PoseToAngle(pose);
+    s_pose          = (BucketPose_e)BUCKET_POSE_NUM;  /* 非姿态表角度 */
+    s_angle_from    = s_angle_now;
+    s_angle_to      = deg;
     s_move_start_ms = HAL_GetTick();
-    s_move_ms     = BUCKET_MOVE_MS;
-    s_moving      = true;
+    s_move_ms       = BUCKET_MOVE_MS;
+    s_moving        = true;
 
     /* BUCKET_MOVE_MS 为 0 时立即到位 */
     if (s_move_ms == 0U)
@@ -131,6 +131,20 @@ uint8_t Bucket_SetPose(BucketPose_e pose)
         s_moving = false;
     }
     return 0U;
+}
+
+uint8_t Bucket_SetPose(BucketPose_e pose)
+{
+    uint8_t ret;
+
+    if (pose >= BUCKET_POSE_NUM) { return 2U; }
+
+    ret = Bucket_SetAngle(Bucket_PoseToAngle(pose));
+    if (ret == 0U)
+    {
+        s_pose = pose;
+    }
+    return ret;
 }
 
 uint8_t Bucket_SetPoseSlow(BucketPose_e pose, uint16_t ms)

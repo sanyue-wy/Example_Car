@@ -75,6 +75,12 @@ extern "C" {
 /* 前后轴距(mm): 差速底盘不用, 保留给日志/后续扩展 */
 #define WHEEL_BASE_MM            120.0f
 
+/* ---- 四轮逻辑位置 -> AT8236 通道(实车接线) ----
+ * 映射本体放在 chassis_map.h(调试层也包含同一份, 避免两处不一致):
+ *   左前=M4, 左后=M3, 右前=M1, 右后=M2。
+ * 换驱动板/重接线只改 chassis_map.h 里那一行, 运动学与里程计不用动。 */
+#include "chassis_map.h"
+
 /* ---- 升降丝杆 ---- */
 #define LIFT_SCREW_LEAD_MM       2.0f    /* 丝杆导程: 电机输出轴一圈 -> 平台 mm */
 #define LIFT_ENCODER_PPR         11
@@ -210,11 +216,22 @@ extern "C" {
  *============================================================================*/
 #define BUCKET_ANG_STOW          20
 #define BUCKET_ANG_SCOOP         120
-#define BUCKET_ANG_CARRY         60
+#define BUCKET_ANG_CARRY         135
 #define BUCKET_ANG_DUMP          200
 #define BUCKET_MOVE_MS           400U     /* 舵机无反馈, 固定等待判到位 */
-/* 舵机启动前的保持角: 只有 APP_RUN 才输出 PWM, 之前完全不输出 */
+
+/* 调零角度: 270° 舵机的行程中点, 135° = 1500us。
+ * 装摇臂/调零时让舵机停在这里, 机械位置装好后再改回正式角度。 */
+#define BUCKET_ANG_ZERO          135
+/* 舵机启动前的保持角 */
 #define BUCKET_ANG_SAFE          BUCKET_ANG_STOW
+
+/* 上电时 Bucket_Init() 立即输出的角度(之后一直保持, 等 Arm):
+ *   调零阶段 -> BUCKET_ANG_ZERO (135°)
+ *   正式固件 -> BUCKET_ANG_SAFE (上电就回到安全位)
+ * 二选一, 另一行注释掉即可。 */
+#define BUCKET_ANG_INIT          BUCKET_ANG_ZERO
+/* #define BUCKET_ANG_INIT       BUCKET_ANG_SAFE */
 
 /*==============================================================================
  * 9. 运动参数
@@ -303,6 +320,9 @@ _Static_assert(LIFT_H_LEVEL2 > MID_PLATFORM_TOP_MM,
 #endif
 #if (BUCKET_ANG_DUMP < 0) || (BUCKET_ANG_DUMP > 270)
 #error "app_config.h: BUCKET_ANG_DUMP 超出 0~270"
+#endif
+#if (BUCKET_ANG_INIT < 0) || (BUCKET_ANG_INIT > 270)
+#error "app_config.h: BUCKET_ANG_INIT 超出 0~270"
 #endif
 
 #ifdef __cplusplus

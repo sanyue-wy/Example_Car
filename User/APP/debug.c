@@ -29,6 +29,7 @@
 #include "drv_tim.h"
 #include "at8236.h"
 #include "usart.h"
+#include "uart_config.h"
 #include "main.h"
 
 #if (DEBUG_VISION_ENABLE == 1)
@@ -46,11 +47,6 @@
 #define MM_INT(v)     ((long)(v))
 #define MM_FRAC(v)    ((long)(((v) - (float)(long)(v)) * 100.0f * \
                               ((((v) - (float)(long)(v)) < 0.0f) ? -1.0f : 1.0f)))
-
-/* 打开蓝牙可视化时本文件的文本自检全部不编译(串口已被 COBS 帧独占) */
-#if (DEBUG_VISION_ENABLE == 0)
-static uint32_t s_last_print_ms;
-#endif
 
 /* 控制节拍实现标记: 某些层需要自己跑 Chassis_Task, 用一个宏统一开关 */
 #if (motor_open_debug == 1) || (motor_pid_debug == 1) || \
@@ -76,7 +72,8 @@ static void UartRxEcho(UART_PortObject *port, uint8_t *data, uint16_t size)
 static void Debug_Init(void)
 {
     uart1_port.on_rx = UartRxEcho;
-    DBG("[uart] [PASS] 用串口助手 115200 发任意字节, 应原样回显\r\n");
+    DBG("[uart] [PASS] 用串口助手 %u 发任意字节, 应原样回显\r\n",
+        (unsigned)UART_DEBUG_BAUD);
 }
 
 static void Debug_Run(uint32_t now)
@@ -164,7 +161,7 @@ static void Debug_Run(uint32_t now)
     if ((now - s_last_print_ms) >= 500U)
     {
         s_last_print_ms = now;
-        DBG("[motor] cmd=%ld | M1=%ld M2=%ld M3=%ld M4=%ld\r\n",
+        DBG("[motor] cmd=%ld | LF=%ld LR=%ld RF=%ld RR=%ld\r\n",
             (long)s_cmd,
             (long)fb.wheel_speed_mmps[0], (long)fb.wheel_speed_mmps[1],
             (long)fb.wheel_speed_mmps[2], (long)fb.wheel_speed_mmps[3]);
@@ -211,10 +208,280 @@ static void Debug_Run(uint32_t now)
     if ((now - s_last_print_ms) >= 100U)
     {
         s_last_print_ms = now;
-        DBG("[pid] tgt=%ld | FL=%ld FR=%ld RL=%ld RR=%ld\r\n",
+        DBG("[pid] tgt=%ld | LF=%ld LR=%ld RF=%ld RR=%ld\r\n",
             (long)s_steps[s_step_idx],
             (long)fb.wheel_speed_mmps[0], (long)fb.wheel_speed_mmps[1],
             (long)fb.wheel_speed_mmps[2], (long)fb.wheel_speed_mmps[3]);
+    }
+}
+
+/*==============================================================================
+ * 第 9 层: single_motor_debug —— 单通道正反转(电机会转!)
+ *   绕开底盘左右分组, 直接对驱动板某一个通道发速度, 用于逐个排查
+ *   电机/接线/方向。编译条件: single_motor_debug==1 且 motor1..4 恰好一个为 1
+ *   (debug_config.h 已用 #error 保证)。
+ *============================================================================*/
+#elif (single_motor_debug == 1)
+
+#if   (motor1_test == 1)
+#define DBG_CH          0U      /* M1 */
+#elif (motor2_test == 1)
+#define DBG_CH          1U      /* M2 */
+#elif (motor3_test == 1)
+#define DBG_CH          2U      /* M3 */
+#elif (motor4_test == 1)
+#define DBG_CH          3U      /* M4 */
+#endif
+
+#define DBG_MOTOR_NO    (DBG_CH + 1U)
+
+/* 两种驱动方式同一套相位/时间轴, 只换下发函数与命令量纲 */
+#if (single_motor_loop == 1)
+#define DBG_CMD_HI      1500    /* 开环 PWM ‰, 约 42% 占空比 */
+#define DBG_CMD_UNIT    "pwm"
+#else
+#define DBG_CMD_HI      200     /* 闭环速度 mm/s */
+#define DBG_CMD_UNIT    "mm/s"
+#endif
+
+/* 只跑这么久就停, 停后滑行(coast)松开轮子, 方便手转核对编码器 */
+#ifndef DBG_RUN_MS
+#define DBG_RUN_MS      3000U
+#endif
+
+static uint32_t s_phase_ms;
+static uint32_t s_tx_ms;
+static uint32_t s_diag_ms;
+static uint8_t  s_phase;
+static int16_t  s_cmd;
+static int32_t  s_enc_last;
+static uint8_t  s_enc_seeded;
+static int32_t  s_enc_all_last[AT8236_MOTOR_NUM];
+static uint8_t  s_diag_seeded;
+
+/**
+  * @brief  通道 -> 本车物理轮位(从底盘映射反查, 换接线后自动跟着变)
+  */
+static const char *Debug_ChannelPos(void)
+{
+    static const char *const names[CHASSIS_MOTOR_NUM] = { "LF", "LR", "RF", "RR" };
+    const Chassis_Object *ch = App_GetChassis();
+
+    if (ch != NULL)
+    {
+        for (uint8_t i = 0U; i < CHASSIS_MOTOR_NUM; i++)
+        {
+            if (ch->cfg.wheel_map[i] == DBG_CH)
+            {
+                return names[i];
+            }
+        }
+    }
+    return "?";
+}
+
+/**
+  * @brief  由编码器增量推算轮速(mm/s), 与驱动板 $MSPD 互为校验
+  * @note   全部用整数打印, 这里只做一次浮点换算, 不依赖 printf 浮点
+  */
+static float Debug_EncSpeedMmps(int32_t denc, uint32_t dt_ms)
+{
+    const Chassis_Object *ch = App_GetChassis();
+    float counts_per_rev = 4532.0f;   /* 11 线 x4 x103, 与 app_config.h 一致 */
+    float wheel_mm       = 67.0f;
+
+    if (ch != NULL)
+    {
+        counts_per_rev = (float)ch->cfg.counts_per_rev;
+        wheel_mm       = ch->cfg.wheel_diameter_mm;
+    }
+    if ((dt_ms == 0U) || (counts_per_rev <= 0.0f))
+    {
+        return 0.0f;
+    }
+
+    /* mm/s = 计数 x (pi*D / CPR) x (1000 / 毫秒数) */
+    return ((float)denc * (3.14159265f * wheel_mm / counts_per_rev)) *
+           (1000.0f / (float)dt_ms);
+}
+
+/**
+  * @brief  只给目标通道下指令, 其余三路为 0
+  * @note   闭环用 $spd(0=PID 锁轮), 开环用 $pwm(0=滑行)
+  */
+static void Debug_Send(int16_t cmd)
+{
+    AT8236_Object *board = App_GetBoard();
+    int16_t arr[AT8236_MOTOR_NUM] = { 0, 0, 0, 0 };
+
+    if (board == NULL)
+    {
+        return;
+    }
+
+    arr[DBG_CH] = cmd;
+#if (single_motor_loop == 1)
+    (void)AT8236_SetPwmArray(board, arr);
+#else
+    (void)AT8236_SetSpeedArray(board, arr);
+#endif
+}
+
+static void Debug_Init(void)
+{
+    if (App_GetBoard() == NULL)
+    {
+        return;
+    }
+
+    /* 其余三路指令为 0, 只让目标通道动 */
+    s_phase      = 0U;
+    s_cmd        = (int16_t)DBG_CMD_HI;
+    s_phase_ms   = HAL_GetTick();
+    s_tx_ms      = s_phase_ms;
+    s_diag_ms    = s_phase_ms;
+    s_enc_seeded = 0U;
+    s_diag_seeded = 0U;
+    Debug_Send(s_cmd);
+
+    DBG("[m%u] [PASS] 单电机 M%u (%s) %s: %d 只跑 %lu ms, 然后滑行停住(请架空!)\r\n",
+        (unsigned)DBG_MOTOR_NO, (unsigned)DBG_MOTOR_NO, Debug_ChannelPos(),
+        (single_motor_loop == 1) ? "开环PWM" : "闭环速度",
+        (int)DBG_CMD_HI, (unsigned long)DBG_RUN_MS);
+}
+
+static void Debug_Run(uint32_t now)
+{
+    AT8236_Object *board = App_GetBoard();
+
+    if (board == NULL)
+    {
+        DBG("[m%u] [FAIL] 驱动板未就绪\r\n", (unsigned)DBG_MOTOR_NO);
+        return;
+    }
+
+    /* 指令看门狗(默认关闭), 顺手维持在线判断 */
+    AT8236_Task(board, now);
+
+    /* 只跑 DBG_RUN_MS, 然后滑行松开轮子并永久停住, 方便手转验证编码器 */
+    if ((s_phase == 0U) && ((now - s_phase_ms) >= DBG_RUN_MS))
+    {
+        s_phase    = 1U;
+        s_cmd      = 0;
+        s_phase_ms = now;
+        (void)AT8236_Coast(board);   /* $pwm:0, 断开输出, 轮子可自由手转 */
+        DBG("[m%u] 已停止(coast): 现在手转 %s 轮, 看 enc/2s 里 M%u 的计数\r\n",
+            (unsigned)DBG_MOTOR_NO, Debug_ChannelPos(), (unsigned)DBG_MOTOR_NO);
+    }
+
+    /* 保持型指令仍每 200ms 重发一次(只在运行段), 防止单帧被 UART 忙丢掉 */
+    if ((s_phase == 0U) && ((now - s_tx_ms) >= 200U))
+    {
+        s_tx_ms = now;
+        Debug_Send(s_cmd);
+    }
+
+    if ((now - s_last_print_ms) >= 500U)
+    {
+        int32_t enc  = AT8236_GetEncoderTotal(board, DBG_CH);
+        int32_t denc;
+        uint32_t dt_ms = now - s_last_print_ms;
+
+        if (s_enc_seeded == 0U)
+        {
+            /* 第一帧只建立基准, 不打印假的增量 */
+            s_last_print_ms = now;
+            s_enc_seeded    = 1U;
+            s_enc_last      = enc;
+            return;
+        }
+
+        denc       = enc - s_enc_last;
+        s_enc_last = enc;
+        s_last_print_ms = now;
+
+        /* 设定速度 vs 驱动板回报速度 vs 编码器实测速度, 三者对照 */
+        {
+            /* 打印成 "整数.两位", 避免依赖浮点 printf */
+            float enc_spd = Debug_EncSpeedMmps(denc, dt_ms);
+            float board_spd = AT8236_GetSpeedMmps(board, DBG_CH);
+            long enc_i = (long)enc_spd;
+            long enc_f = (long)((enc_spd - (float)enc_i) * 100.0f);
+            long brd_i = (long)board_spd;
+            long brd_f = (long)((board_spd - (float)brd_i) * 100.0f);
+
+            if (enc_f < 0) { enc_f = -enc_f; }
+            if (brd_f < 0) { brd_f = -brd_f; }
+
+#if (single_motor_loop == 1)
+            DBG("[m%u] set=%ld pwm | board=%ld.%02ld | enc=%ld.%02ld mm/s "
+                "(denc=%ld/%lums)\r\n",
+                (unsigned)DBG_MOTOR_NO, (long)s_cmd, brd_i, brd_f,
+                enc_i, enc_f, (long)denc, (unsigned long)dt_ms);
+#else
+            DBG("[m%u] set=%ld mm/s | board=%ld.%02ld | enc=%ld.%02ld mm/s "
+                "(denc=%ld/%lums)\r\n",
+                (unsigned)DBG_MOTOR_NO, (long)s_cmd, brd_i, brd_f,
+                enc_i, enc_f, (long)denc, (unsigned long)dt_ms);
+#endif
+        }
+    }
+
+    /* ---- 每 2s 打一行链路诊断: 区分"电机不动"和"反馈收不到" ----
+       rx=收到完整帧数  spd=$MSPD帧数  all=$MAll帧数  ack=配置回显帧数
+       tx_ok=成功发出的指令数  tx_busy=DMA忙丢掉的指令数
+       若 rx 一直不涨 -> 驱动板没回话(串口/供电/波特率), 跟电机无关
+       若 rx 涨但 spd 不涨 -> 没开速度上报($upload) */
+    if ((now - s_diag_ms) >= 2000U)
+    {
+        int32_t enc_all[AT8236_MOTOR_NUM];
+        long d[AT8236_MOTOR_NUM];
+        float batt = AT8236_GetBatteryVoltage(board);
+        long batt_i = (long)batt;
+        long batt_f = (long)((batt - (float)batt_i) * 10.0f);
+        uint8_t i;
+
+        s_diag_ms = now;
+
+        if (batt_f < 0) { batt_f = -batt_f; }
+
+        for (i = 0U; i < AT8236_MOTOR_NUM; i++)
+        {
+            enc_all[i] = AT8236_GetEncoderTotal(board, i);
+            d[i] = s_diag_seeded ? (long)(enc_all[i] - s_enc_all_last[i]) : 0L;
+            s_enc_all_last[i] = enc_all[i];
+        }
+        s_diag_seeded = 1U;
+
+        DBG("[m%u] link: online=%u rx=%lu spd=%lu all=%lu ack=%lu "
+            "tx_ok=%lu tx_busy=%lu batt=%ld.%ldV\r\n",
+            (unsigned)DBG_MOTOR_NO,
+            (unsigned)AT8236_IsOnline(board, now, 1000U),
+            (unsigned long)board->stats.rx_frames,
+            (unsigned long)board->stats.speed_frames,
+            (unsigned long)board->stats.total_frames,
+            (unsigned long)board->stats.ack_frames,
+            (unsigned long)board->stats.tx_ok,
+            (unsigned long)board->stats.tx_busy,
+            batt_i, batt_f);
+
+        DBG("[m%u] enc/2s: M1=%ld M2=%ld M3=%ld M4=%ld\r\n",
+            (unsigned)DBG_MOTOR_NO, d[0], d[1], d[2], d[3]);
+
+        /* 探针: 主动问一次电压。收到 $Battery 就说明 RX 链路是通的。
+           同时打印 UART 驱动自己的计数, 判断是"没字节进来"还是
+           "字节进来了但组帧失败"。 */
+        (void)AT8236_QueryBattery(board);
+
+        DBG("[m%u] uart: rx_ev=%lu rx_err=%lu tx_err=%lu err=%lu "
+            "gState=%u RxState=%u\r\n",
+            (unsigned)DBG_MOTOR_NO,
+            (unsigned long)board->uart.stats.rx_count,
+            (unsigned long)board->uart.stats.rx_error,
+            (unsigned long)board->uart.stats.tx_error,
+            (unsigned long)board->uart.stats.err_count,
+            (unsigned)board->uart.huart->gState,
+            (unsigned)board->uart.huart->RxState);
     }
 }
 
@@ -223,41 +490,39 @@ static void Debug_Run(uint32_t now)
  *============================================================================*/
 #elif (servo_debug == 1)
 
-static uint32_t s_pose_ms;
-static uint8_t  s_pose;
+#define DEBUG_BUCKET_ZERO_ANG   ((uint16_t)BUCKET_ANG_ZERO)  /* 调零角度, 见 app_config.h */
+
+static uint8_t s_zero_reported;
 
 static void Debug_Init(void)
 {
+    uint8_t ret;
+
     Bucket_Arm();                 /* 台架调试允许输出 */
-    s_pose    = 0U;
-    s_pose_ms = HAL_GetTick();
-    DBG("[servo] [PASS] STOW->SCOOP->CARRY->DUMP, 每档 1.5s\r\n");
+    s_zero_reported = 0U;
+
+    /* 一次性输出调零角度, 之后保持不动(Debug_Run 不再重复下发) */
+    ret = Bucket_SetAngle((uint16_t)DEBUG_BUCKET_ZERO_ANG);
+    if (ret == 0U)
+    {
+        DBG("[servo] [ZERO] -> %u deg (%lu us), 保持不动\r\n",
+            (unsigned)DEBUG_BUCKET_ZERO_ANG,
+            (unsigned long)(500U + 2000UL * DEBUG_BUCKET_ZERO_ANG / 270U));
+    }
+    else
+    {
+        DBG("[servo] [FAIL] SetAngle ret=%u\r\n", (unsigned)ret);
+    }
 }
 
 static void Debug_Run(uint32_t now)
 {
-    if ((now - s_pose_ms) >= 1500U)
-    {
-        s_pose_ms = now;
-        s_pose = (uint8_t)((s_pose + 1U) % (uint8_t)BUCKET_POSE_NUM);
+    (void)now;
 
-        if (Bucket_SetPose((BucketPose_e)s_pose) != 0U)
-        {
-            DBG("[servo] [FAIL] SetPose 被拒绝(未 Arm?)\r\n");
-            return;
-        }
-        DBG("[servo] pose=%u -> angle=%u deg\r\n",
-            (unsigned)s_pose, (unsigned)Bucket_GetAngle());
-    }
-
-    if ((now - s_last_print_ms) >= 1000U)
+    if ((s_zero_reported == 0U) && Bucket_IsDone())
     {
-        s_last_print_ms = now;
-        if (Bucket_IsDone())
-        {
-            DBG("[servo] [PASS] pose=%u angle=%u\r\n",
-                (unsigned)Bucket_GetPose(), (unsigned)Bucket_GetAngle());
-        }
+        s_zero_reported = 1U;
+        DBG("[servo] [PASS] 到位 angle=%u deg\r\n", (unsigned)Bucket_GetAngle());
     }
 }
 

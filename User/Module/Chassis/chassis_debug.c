@@ -3,6 +3,7 @@
 #if chassis_debug == 1
 
 #include "chassis.h"
+#include "chassis_map.h"
 #include "at8236.h"
 #include "drv_uart.h"
 #include "usart.h"
@@ -23,8 +24,8 @@
    注意:
    1. 电机会转! 必须架空车轮, 并确保四周没有人员/线缆;
    2. 方向检查以"四轮同向/左右差速"为准, 不假设某侧绝对正负。若 FAIL:
-      - 某一路反向: 对应位写进 chassis cfg.invert_mask(bit0=M1 ... bit3=M4);
-      - 左右差速相反: 先核对 M1/M2 是否都在左侧、M3/M4 是否都在右侧;
+      - 某一路反向: 对应位写进 chassis cfg.invert_mask(bit0=左前 ... bit3=右后);
+      - 左右差速相反: 先核对 chassis_map.h 的映射(左前/左后是否真的在左侧);
       - 航向角符号相反: 通常是左右轮接反或 invert_mask 配反;
    3. 里程计依赖 $mline=11、$mphase=103、$wdiameter=67 与实际轮径/轮距,
       本自检会写入 67mm, 装车后请实测修改 ATD_WHEEL_MM / ATD_TRACK_MM;
@@ -36,7 +37,7 @@
 #define CD_TRACK_MM       150.0f   /* 左右轮中心距 */
 #define CD_WHEEL_MM       67.0f    /* 轮径 */
 #define CD_COUNTS_REV     4532U    /* 11 线 × 4 倍频 × 103 减速比 */
-#define CD_INVERT_MASK    0x00U    /* 逐轮换向, bit0=M1 ... bit3=M4 */
+#define CD_INVERT_MASK    0x00U    /* 逐轮换向, bit0=左前 ... bit3=右后 */
 
 /* ---- 测试参数 ----------------------------------------------------------- */
 #define CD_CFG_GAP_MS     150U     /* 两条配置指令间隔(写 flash) */
@@ -245,15 +246,15 @@ static void CdCheckTurn(const char *what, int8_t left_sign, int8_t right_sign)
 
     if (left_ok == 0U)
     {
-      suggest ^= 0x03U; /* M1/M2 */
+      suggest ^= 0x03U; /* 左前/左后 */
     }
     if (right_ok == 0U)
     {
-      suggest ^= 0x0CU; /* M3/M4 */
+      suggest ^= 0x0CU; /* 右前/右后 */
     }
     UART_Port_Printf(&uart1_port,
-                     "[cd] hint: try invert_mask=0x%02X, and check M1/M2 on left, "
-                     "M3/M4 on right\r\n", (unsigned)suggest);
+                     "[cd] hint: try invert_mask=0x%02X, and check chassis_map.h "
+                     "(left/right grouping)\r\n", (unsigned)suggest);
   }
 }
 
@@ -402,6 +403,15 @@ void Chassis_Debug_Init(void)
   chassis_cfg.wheel_diameter_mm   = CD_WHEEL_MM;
   chassis_cfg.counts_per_rev      = CD_COUNTS_REV;
   chassis_cfg.invert_mask         = CD_INVERT_MASK;
+  {
+    /* 与比赛固件共用同一份实车接线映射(chassis_map.h) */
+    static const uint8_t map[CHASSIS_MOTOR_NUM] = CHASSIS_WHEEL_MAP;
+
+    for (uint8_t i = 0U; i < CHASSIS_MOTOR_NUM; i++)
+    {
+      chassis_cfg.wheel_map[i] = map[i];
+    }
+  }
 
   if (Chassis_Init(&s_chassis, &chassis_cfg,
                    Chassis_GetAT8236Ops(), &s_board) != (uint8_t)CHASSIS_OK)
@@ -420,6 +430,13 @@ void Chassis_Debug_Init(void)
                    (unsigned long)CD_COUNTS_REV, (unsigned)CD_INVERT_MASK,
                    CdRound(s_chassis.cfg.max_linear_mmps),
                    CdRound(s_chassis.cfg.max_angular_dps));
+  UART_Port_Printf(&uart1_port,
+                   "[cd] wheel map: LF=M%u LR=M%u RF=M%u RR=M%u "
+                   "(left-front/left-rear/right-front/right-rear)\r\n",
+                   (unsigned)(s_chassis.cfg.wheel_map[0] + 1U),
+                   (unsigned)(s_chassis.cfg.wheel_map[1] + 1U),
+                   (unsigned)(s_chassis.cfg.wheel_map[2] + 1U),
+                   (unsigned)(s_chassis.cfg.wheel_map[3] + 1U));
   UART_Port_Printf(&uart1_port,
                    "[cd] measured params must match the real car; wrong wheel/track "
                    "only scales odometry, wrong invert/direction fails the checks\r\n");

@@ -112,10 +112,18 @@ uint32_t   App_GetElapsedMs(void);
 struct Chassis_Object;
 struct Elevating_Object;
 struct AppBucket;
+struct AT8236_Object;
 
 const struct Chassis_Object   *App_GetChassis(void);
 const struct Elevating_Object *App_GetLift(void);
 struct AppBucket              *App_GetBucket(void);
+
+/**
+ * @brief  驱动板对象(供单电机自检等调试层直接操作通道)
+ * @note   返回可写指针; 仅在 App_InitDrivers 成功后非 NULL。
+ *          正常业务代码不要用它, 走 Chassis 抽象。
+ */
+struct AT8236_Object *App_GetBoard(void);
 
 #ifdef __cplusplus
 }

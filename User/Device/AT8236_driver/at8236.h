@@ -60,7 +60,9 @@ extern "C" {
   *       $MTEP:m1,m2,m3,m4#  10ms 实时编码器计数
   *       $MSPD:m1,m2,m3,m4#  轮子速度 mm/s
   *       $Battery:7.40V#     $read_vol# 的应答
-  *   - 驱动板丝印 M1~M4 对应小车: M1 左前, M2 左后, M3 右前, M4 右后。
+  *   - 驱动板丝印 M1~M4 只代表板上通道号 0~3; 与小车轮位的实际对应关系由
+  *     实车接线决定, 本车见 app_config.h / chassis_map.h 的 CHASSIS_WHEEL_MAP
+  *     (不要假设 M1 一定是左前)。
   *
   * 硬件/工程约束(无法封装掉, 迁移时注意):
   * 1. 本工程用 USART2(PA2=TX -> 驱动板 RX2, PA3=RX <- 驱动板 TX2), GND 共地;
